@@ -21,3 +21,7 @@ clap.workspace = true
 bosync-windows = { path = "../bosync-windows" }
 ctrlc.workspace = true
 notify.workspace = true
+
+# Used only by the Linux `mount` command (FUSE).
+[target.'cfg(target_os = "linux")'.dependencies]
+bosync-linux = { path = "../bosync-linux" }

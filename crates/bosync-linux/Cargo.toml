@@ -1,0 +1,17 @@
+[package]
+name = "bosync-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bosync-core = { path = "../bosync-core" }
+bosync-git = { path = "../bosync-git" }
+anyhow.workspace = true
+tracing.workspace = true
+
+# FUSE is Linux-only; depend on it (and libc for errno/uid) only there so the workspace builds
+# on every OS.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
+libc.workspace = true

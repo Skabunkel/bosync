@@ -14,8 +14,6 @@
 //!
 //! It is generic over [`CloudSync`], so it has no Windows/Linux/macOS specifics.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -43,23 +41,13 @@ pub struct Proxy {
 impl Proxy {
     /// The per-user proxy directory bosync uses for `remote`, under the OS temp dir.
     ///
-    /// The leaf is a sanitized, hash-suffixed slug of the URL so two different remotes never
-    /// collide and the same remote is always reused. The OS temp dir is already per-user on
-    /// every target platform, which is what the plan calls for.
+    /// Laid out as `bosync/<creator>/<repo>` so several repos (and several creators) live
+    /// side by side. `<creator>`/`<repo>` are the owner and repository name parsed from the
+    /// remote URL. The OS temp dir is already per-user on every target platform, which is
+    /// what the plan calls for.
     pub fn proxy_dir(remote: &str) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        remote.hash(&mut hasher);
-        let digest = hasher.finish();
-
-        let slug: String = remote
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        let slug: String = slug.trim_matches('-').chars().take(48).collect();
-
-        std::env::temp_dir()
-            .join("bosync")
-            .join(format!("{slug}-{digest:016x}"))
+        let (creator, repo) = owner_repo(remote);
+        std::env::temp_dir().join("bosync").join(creator).join(repo)
     }
 
     /// Open the proxy for `remote`, shallow-cloning it if the proxy folder doesn't exist yet.
@@ -161,19 +149,95 @@ impl Proxy {
     }
 }
 
+/// Parse the `(creator, repo)` pair out of a git remote URL, for the `bosync/<creator>/<repo>`
+/// proxy layout. Handles both URL forms (`scheme://host/owner/repo[.git]`) and scp-like forms
+/// (`git@host:owner/repo[.git]`). Components are sanitized to safe path segments; missing
+/// parts fall back to `unknown` / `repo` so a malformed URL still yields a usable directory.
+fn owner_repo(remote: &str) -> (String, String) {
+    let trimmed = remote.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+
+    // Reduce to the path portion after the host.
+    let path = if let Some(idx) = trimmed.find("://") {
+        let after = &trimmed[idx + 3..];
+        after.split_once('/').map(|(_, p)| p).unwrap_or("")
+    } else if let Some((_, p)) = trimmed.split_once(':') {
+        p // scp-like `host:owner/repo`
+    } else {
+        trimmed
+    };
+
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let repo = parts.last().copied().unwrap_or("repo");
+    let owner = if parts.len() >= 2 {
+        parts[parts.len() - 2]
+    } else {
+        "unknown"
+    };
+    (sanitize_segment(owner), sanitize_segment(repo))
+}
+
+/// Make `s` a safe single path segment: keep alphanumerics, `-`, `_`, `.`; replace the rest
+/// with `-`. Never empty.
+fn sanitize_segment(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('-');
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::TmpDir;
 
     #[test]
-    fn proxy_dir_is_stable_and_distinct_per_remote() {
-        let a1 = Proxy::proxy_dir("https://github.com/owner/repo.git");
-        let a2 = Proxy::proxy_dir("https://github.com/owner/repo.git");
+    fn owner_repo_parses_url_and_scp_forms() {
+        assert_eq!(
+            owner_repo("https://github.com/owner/repo.git"),
+            ("owner".into(), "repo".into())
+        );
+        assert_eq!(
+            owner_repo("git@github.com:creator/myrepo.git"),
+            ("creator".into(), "myrepo".into())
+        );
+        assert_eq!(
+            owner_repo("ssh://git@host:22/team/project"),
+            ("team".into(), "project".into())
+        );
+        // Trailing slash and no .git suffix.
+        assert_eq!(
+            owner_repo("https://gitlab.com/grp/sub/"),
+            ("grp".into(), "sub".into())
+        );
+    }
+
+    #[test]
+    fn proxy_dir_groups_by_creator_then_repo() {
+        let base = std::env::temp_dir().join("bosync");
+        assert_eq!(
+            Proxy::proxy_dir("https://github.com/owner/repo.git"),
+            base.join("owner").join("repo")
+        );
+        // Same creator, different repos sit side by side; the same remote is stable.
+        let a1 = Proxy::proxy_dir("git@github.com:owner/repo.git");
+        let a2 = Proxy::proxy_dir("git@github.com:owner/repo.git");
         let b = Proxy::proxy_dir("git@github.com:owner/other.git");
         assert_eq!(a1, a2, "same remote -> same proxy dir");
-        assert_ne!(a1, b, "different remotes -> different proxy dirs");
-        assert!(a1.starts_with(std::env::temp_dir().join("bosync")));
+        assert_ne!(a1, b, "different repo -> different proxy dir");
+        assert_eq!(a1.parent(), b.parent(), "same creator -> shared parent dir");
     }
 
     #[test]

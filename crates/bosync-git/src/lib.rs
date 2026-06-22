@@ -96,6 +96,25 @@ impl GitBackend {
         Ok(out)
     }
 
+    /// Stat a root-relative path in `HEAD`: `Some((is_dir, size))`, or `None` if absent.
+    /// The empty path is the root tree. Cheap — resolves the object header, never the data
+    /// for directories; used by the FUSE projection for `lookup`/`getattr`.
+    pub fn stat(&self, rel: &str) -> Option<(bool, u64)> {
+        if rel.is_empty() {
+            return Some((true, 0));
+        }
+        let repo = self.repo.to_thread_local();
+        let id = repo
+            .rev_parse_single(format!("HEAD:{rel}").as_str())
+            .ok()?;
+        let obj = id.object().ok()?;
+        match obj.kind {
+            gix::object::Kind::Tree => Some((true, 0)),
+            gix::object::Kind::Blob => Some((false, obj.data.len() as u64)),
+            _ => None,
+        }
+    }
+
     /// Read the full contents of the blob at the given root-relative path in `HEAD`.
     pub fn read_blob(&self, rel: &str) -> Result<Vec<u8>> {
         let repo = self.repo.to_thread_local();

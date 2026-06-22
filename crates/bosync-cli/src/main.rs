@@ -167,9 +167,25 @@ fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
+    // The FUSE projection is read-only today; accept the flag for parity with Windows.
+    let _ = readonly;
+    std::fs::create_dir_all(&drive)
+        .with_context(|| format!("creating mountpoint {drive:?}"))?;
+    let git = GitBackend::open(&repo)?;
+    println!(
+        "bosync mounting (read-only FUSE): {} -> {}",
+        repo.display(),
+        drive.display()
+    );
+    println!("Press Ctrl+C, or run:  fusermount3 -u {}", drive.display());
+    bosync_linux::mount(git, &drive) // blocks until unmounted
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn mount(_repo: PathBuf, _drive: PathBuf, _readonly: bool) -> Result<()> {
-    anyhow::bail!("`mount` is currently Windows-only; Linux (FUSE) and macOS (File Provider) are not wired up yet")
+    anyhow::bail!("`mount` is not wired up for this OS yet (macOS File Provider is pending)")
 }
 
 #[cfg(windows)]
@@ -179,9 +195,15 @@ fn unmount() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn unmount() -> Result<()> {
-    anyhow::bail!("`unmount` is currently Windows-only")
+    // FUSE has no persistent registration to clean up; unmount the mountpoint directly.
+    anyhow::bail!("on Linux, unmount the FUSE drive with `fusermount3 -u <mountpoint>`")
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn unmount() -> Result<()> {
+    anyhow::bail!("`unmount` is not wired up for this OS yet")
 }
 
 /// Remove the `\\?\` extended-length prefix that `canonicalize` adds on Windows.

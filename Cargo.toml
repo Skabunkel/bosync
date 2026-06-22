@@ -4,6 +4,7 @@ members = [
     "crates/bosync-git",
     "crates/bosync-sync",
     "crates/bosync-windows",
+    "crates/bosync-linux",
     "crates/bosync-core",
     "crates/bosync-cli",
 ]
@@ -40,3 +41,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Pure-Rust text diffing for patch generation (version X -> current Y).
 similar = "2"
+# Linux FUSE bindings. default-features=false drops the libfuse C linkage; fuser then mounts
+# via the `fusermount3` helper, keeping the dependency Rust-only.
+fuser = { version = "0.15", default-features = false }
+libc = "0.2"
