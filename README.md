@@ -1,5 +1,13 @@
 # bosync
 
+Once upton a time called bofinc disk sync, it was part of a git clone thing i was building. 
+I had 12 000 dreams of nice projects. 
+
+Im still working on it but people might want this stuff for future use. Who knows, people might really use it.
+
+
+## Original text
+
 A proof-of-concept that makes a **Git repository behave like OneDrive / Google Drive** in
 Windows Explorer, using the **Windows Cloud Filter API** (`cldapi.dll`) — the same OS
 feature OneDrive, Dropbox and Google Drive for Desktop are built on.

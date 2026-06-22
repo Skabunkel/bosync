@@ -130,7 +130,7 @@
 <tr><td>Linux mount</td><td><code>fuser</code> (FUSE)</td><td>Pure Rust</td><td>Mount the proxy folder; serve <code>readdir</code>/<code>open</code>/<code>read</code> from the shallow clone, hydrate on access.</td></tr>
 <tr><td>macOS mount</td><td>File Provider (objc FFI)</td><td>Pure-Rust FFI</td><td>File Provider extension over the proxy; same trait as the other two platforms.</td></tr>
 <tr><td>Async runtime</td><td><code>tokio</code></td><td>Pure Rust</td><td>Hydration, refetch and the idle engine are I/O bound; serve callbacks off the OS thread.</td></tr>
-<tr><td>Logging</td><td><code>tracing</code></td><td>Pure Rust</td><td>Observability across the proxy lifecycle and idle engine. (A custom control CLI is deferred for now — invoked directly with a config/env for the repo URL.)</td></tr>
+<tr><td>Logging / CLI</td><td><code>tracing</code>, <code>clap</code></td><td>Pure Rust</td><td>Observability + a small control CLI (<code>bosync mount</code> / <code>unmount</code>). The <code>sync</code> interview command is deferred for now.</td></tr>
 </tbody>
 </table>
 </div>
@@ -222,7 +222,7 @@
 <div class="panel">
 <h3>Out of scope (POC)</h3>
 <ul>
-<li><span class="tag out">OUT</span> Custom <code>bosync</code> control CLI (mount/unmount/status) — deferred</li>
+<li><span class="tag out">OUT</span> <code>bosync sync</code> interview command — deferred</li>
 <li><span class="tag out">OUT</span> Full parity across all three OSes at once</li>
 <li><span class="tag out">OUT</span> Merge-conflict UI / auto-merge</li>
 <li><span class="tag out">OUT</span> LFS, submodules, huge-file streaming tuning</li>
@@ -237,7 +237,8 @@
 <div class="flow">bosync/
 ├─ Cargo.toml            <span class="muted">workspace</span>
 ├─ crates/
-│  ├─ bosync-core/     <b>proxy lifecycle, hydrate/dehydrate, idle engine; declares Mount trait</b>
+│  ├─ bosync-cli/      <b>clap CLI: mount / unmount</b>
+│  ├─ bosync-core/     <b>platform-agnostic proxy lifecycle, hydrate/dehydrate, idle engine; declares CloudSync trait</b>
 │  ├─ bosync-git/      <b>gix wrapper: shallow clone, fetch, commit, push, prune (SSH or HTTP)</b>
 │  ├─ bosync-win/      <b>Windows sync logic — Cloud Filter; impl Mount</b>
 │  ├─ bosync-linux/    <b>Linux sync logic — FUSE; impl Mount</b>
