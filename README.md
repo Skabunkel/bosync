@@ -1,9 +1,11 @@
 # bosync
 
 Once upton a time called bofinc disk sync, it was part of a git clone thing i was building. 
-I had 12 000 dreams of nice projects. 
+I had 12 000 dreams and equally as many projects trying to build parts of it. 
 
 Im still working on it but people might want this stuff for future use. Who knows, people might really use it.
+
+I have had AI rewrite alot of this, and change the structure. This does not look like the original project i once created many months ago.
 
 
 ## Original text
