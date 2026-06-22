@@ -9,10 +9,15 @@
 //! (via [`gix::ThreadSafeRepository::to_thread_local`]) so the backend is `Sync` and can
 //! be shared across the Cloud Filter callback threads.
 
+use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use gix::object::tree::EntryKind;
+
+/// A list of blobs as `(path_relative_to_some_root, content)` pairs.
+type BlobList = Vec<(String, Vec<u8>)>;
 
 /// One entry of a directory listing taken from a git tree.
 #[derive(Debug, Clone)]
@@ -202,11 +207,7 @@ impl GitBackend {
 
     /// Collect every blob at or under `path` as `(rel_path_under_path, content)`.
     /// For a single file `rel_path` is empty. Returns `None` if `path` isn't in `rev`.
-    fn collect_blobs_under(
-        &self,
-        rev: &str,
-        path: &str,
-    ) -> Result<Option<Vec<(String, Vec<u8>)>>> {
+    fn collect_blobs_under(&self, rev: &str, path: &str) -> Result<Option<BlobList>> {
         let repo = self.repo.to_thread_local();
         let id = match repo.rev_parse_single(format!("{rev}:{path}").as_str()) {
             Ok(id) => id,
@@ -251,6 +252,68 @@ impl GitBackend {
             "Initial sample commit",
         )?;
         Ok(backend)
+    }
+
+    // ---- Shallow-clone proxy primitives --------------------------------------------
+
+    /// Shallow-clone `url` into `dest` at the given `depth` and check out its working tree.
+    ///
+    /// `url` may be `ssh://` / `git@host:owner/repo` (uses the OS ssh program) or
+    /// `http(s)://` (pure-Rust rustls transport). This is step 1 of the plan: the checked-out
+    /// `dest` folder becomes the on-disk proxy the OS projects as a virtual drive.
+    pub fn clone_shallow(url: &str, dest: &Path, depth: u32) -> Result<Self> {
+        use gix::remote::fetch::Shallow;
+
+        let depth = NonZeroU32::new(depth.max(1)).expect("depth >= 1");
+        let should_interrupt = AtomicBool::new(false);
+
+        let mut fetch = gix::prepare_clone(url, dest)
+            .with_context(|| format!("preparing shallow clone of {url} into {dest:?}"))?
+            .with_shallow(Shallow::DepthAtRemote(depth));
+        let (mut checkout, _) = fetch
+            .fetch_then_checkout(gix::progress::Discard, &should_interrupt)
+            .with_context(|| format!("fetching {url}"))?;
+        let (repo, _) = checkout
+            .main_worktree(gix::progress::Discard, &should_interrupt)
+            .with_context(|| format!("checking out worktree at {dest:?}"))?;
+
+        tracing::info!(%url, ?dest, depth = depth.get(), "shallow clone complete");
+        Ok(Self {
+            repo: repo.into_sync(),
+        })
+    }
+
+    /// Refresh the proxy by redoing the shallow copy from `url`, as the plan describes.
+    ///
+    /// Re-cloning is the simplest way to get a clean, current proxy; local commits are pushed
+    /// on save *before* any refresh, so nothing unpushed is lost here. Returns a fresh backend
+    /// — callers sharing the old handle (the platform provider) must re-acquire it.
+    pub fn refresh_shallow(url: &str, dest: &Path, depth: u32) -> Result<Self> {
+        if dest.exists() {
+            std::fs::remove_dir_all(dest)
+                .with_context(|| format!("clearing proxy {dest:?} before refresh"))?;
+        }
+        Self::clone_shallow(url, dest, depth)
+    }
+
+    /// Push committed changes back to `url`.
+    ///
+    /// NOTE: gix 0.84 does not yet implement sending packs, so there is no pure-Rust push.
+    /// This is the single seam to wire up once gix gains push support (see the "Remote auth"
+    /// risk in PLAN.html). Until then it returns an error; [`crate`] callers keep the commit
+    /// locally and retry, so no data is lost.
+    pub fn push(&self, url: &str) -> Result<()> {
+        anyhow::bail!("git push is not yet supported by gix 0.84 (commit for {url} kept locally)")
+    }
+
+    /// Prune to keep the proxy's git size down (idle maintenance).
+    ///
+    /// A shallow clone already carries almost no history; gix exposes no gc yet, so this is a
+    /// documented no-op rather than shelling out to a non-Rust tool. The seam exists so the
+    /// idle engine can call it today and gain real compaction when gix grows the capability.
+    pub fn prune(&self) -> Result<()> {
+        tracing::debug!("prune: no-op (gix has no gc; shallow clone already minimal)");
+        Ok(())
     }
 
     // ---- Sync interview primitives -------------------------------------------------

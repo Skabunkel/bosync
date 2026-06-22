@@ -10,13 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 bosync-git = { path = "../bosync-git" }
-bosync-cf = { path = "../bosync-cf" }
 bosync-core = { path = "../bosync-core" }
-bosync-sync = { path = "../bosync-sync" }
 anyhow.workspace = true
-serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+
+# Used only by the Windows `mount` command (watcher + Ctrl-C handling).
+[target.'cfg(windows)'.dependencies]
+bosync-windows = { path = "../bosync-windows" }
 ctrlc.workspace = true
 notify.workspace = true

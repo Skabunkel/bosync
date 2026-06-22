@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/bosync-git",
     "crates/bosync-sync",
-    "crates/bosync-cf",
+    "crates/bosync-windows",
     "crates/bosync-core",
     "crates/bosync-cli",
 ]
@@ -20,8 +20,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Pure-Rust git. Default features are pure Rust (no libgit2, no C zlib).
 # `tree-editor` adds Repository::edit_tree for building trees to commit.
-gix = { version = "0.84", features = ["tree-editor"] }
-# Safe wrapper over the Windows Cloud Filter API (cldapi.dll).
+# `blocking-network-client` enables shallow clone / fetch over git:// and ssh:// (ssh uses
+# the OS ssh program). `blocking-http-transport-reqwest-rust-tls` adds http(s) with rustls —
+# pure-Rust TLS, so the only non-Rust transport is the OS's own ssh binary.
+gix = { version = "0.84", features = [
+    "tree-editor",
+    "worktree-mutation",
+    "blocking-network-client",
+    "blocking-http-transport-reqwest-rust-tls",
+] }
+# Safe wrapper over the Windows Cloud Filter API (cldapi.dll). Windows-only; pulled in only
+# by bosync-windows under a cfg(windows) target dependency.
 cloud-filter = "0.0.6"
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"

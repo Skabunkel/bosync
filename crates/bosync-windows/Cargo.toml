@@ -1,0 +1,15 @@
+[package]
+name = "bosync-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bosync-core = { path = "../bosync-core" }
+bosync-git = { path = "../bosync-git" }
+anyhow.workspace = true
+tracing.workspace = true
+
+# Cloud Filter is Windows-only; depend on it only there so the workspace builds on every OS.
+[target.'cfg(windows)'.dependencies]
+cloud-filter.workspace = true

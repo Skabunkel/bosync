@@ -6,6 +6,5 @@ license.workspace = true
 
 [dependencies]
 bosync-git = { path = "../bosync-git" }
-cloud-filter.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
