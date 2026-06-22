@@ -30,7 +30,8 @@
   code{font-family:var(--mono);font-size:.86em;background:var(--panel-2);border:1px solid var(--line);padding:1px 6px;border-radius:6px;color:#ffd9b8}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin:16px 0}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-  @media(max-width:760px){.grid2{grid-template-columns:1fr}h1{font-size:32px}}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  @media(max-width:760px){.grid2,.grid3{grid-template-columns:1fr}h1{font-size:32px}}
   table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14.5px}
   th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
   th{color:var(--ink-dim);font-weight:600;font-size:12px;letter-spacing:.06em;text-transform:uppercase}
@@ -47,6 +48,7 @@
   .tag{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:6px;border:1px solid var(--line)}
   .tag.in{color:var(--green);border-color:rgba(86,211,100,.4)}
   .tag.out{color:var(--red);border-color:rgba(248,81,73,.4)}
+  .tag.os{color:var(--accent-2);border-color:rgba(88,166,255,.4)}
   .risk{border-left:3px solid var(--accent);padding-left:16px;margin:14px 0}
   .risk b{color:var(--ink)}
   .muted{color:var(--ink-dim);font-size:14px}
@@ -61,53 +63,58 @@
 
 <header class="hero">
   <p class="eyebrow">Proof of Concept · Plan for review</p>
-  <h1><span class="gd">bosync</span></h1>
-  <p class="tagline">A OneDrive/Google&nbsp;Drive-style virtual drive in Windows Explorer, where the "cloud" is a Git repository. Files appear instantly as on-demand placeholders and hydrate from Git blobs only when you open them. Built in (as much as possible) pure Rust.</p>
+  <h1><span class="gd">bosync</span> — git as a file system</h1>
+  <p class="tagline">A OneDrive/Google&nbsp;Drive-style virtual drive on <b>Windows, Linux and macOS</b>, where the "cloud" is a Git repository reached over SSH or HTTP. A shallow clone in a per-user temp folder acts as an on-disk proxy; the OS shows it as a cloud-synced drive whose files are <em>cloud-only</em> placeholders. Opening a file re-syncs and hydrates it; saving commits and pushes. Built in (as much as possible) pure Rust.</p>
   <div class="pills">
-    <span class="pill"><b>Cloud Filter API</b> (cldapi)</span>
-    <span class="pill"><b>gix</b> · pure-Rust Git</span>
-    <span class="pill"><b>windows</b> / <b>cloud-filter</b> crate</span>
-    <span class="pill">Platform: <b>Windows 11</b></span>
+    <span class="pill">Backend: <b>Git over SSH / HTTP</b></span>
+    <span class="pill"><b>gix</b> · pure-Rust Git · shallow clone</span>
+    <span class="pill"><b>Windows</b> · Cloud Filter</span>
+    <span class="pill"><b>Linux</b> · FUSE</span>
+    <span class="pill"><b>macOS</b> · File Provider</span>
     <span class="pill">Language: <b>Rust</b></span>
   </div>
 </header>
 
 <h2><span class="n">01</span> The idea in one paragraph</h2>
-<p class="lead">OneDrive, Dropbox and Google Drive's "Drive for Desktop" all sit on the same Windows technology: the <b>Cloud Filter API</b> (a.k.a. Cloud Files / <code>cldapi.dll</code>). It lets a user-space program register a folder as a <b>sync root</b> and fill it with <b>placeholders</b> — files that show up in Explorer with names, sizes and icons but whose <em>contents live elsewhere</em>. When the user opens one, Windows calls back into our program asking for the bytes (<b>hydration</b>). bosync plugs Git into that callback: the placeholder tree is built from a Git commit, and hydration streams the matching Git blob. Editing a file commits it back; pulling from a remote re-projects the tree. The result is a normal-feeling drive whose backing store, history and sync are all Git.</p>
+<p class="lead">bosync turns a Git repository into a virtual drive. We do a <b>shallow clone</b> of the repo into a per-user temp folder — that folder is our <b>on-disk proxy</b> for the repo. We then register that folder with the OS as a cloud-synced drive (Cloud Filter on Windows, a FUSE mount on Linux, File Provider on macOS) and mark every entry as <b>cloud-only</b>: names, sizes and icons show in the file manager, but the bytes are not resident. When a user opens a file we refresh the shallow copy, hydrate that file, and let the open proceed. When they save, we sync the change, <b>commit and push</b> it back to the remote, then return to idle. While idle we periodically re-fetch to stay current, prune history to keep the proxy small, and re-dehydrate files that haven't been touched for a few minutes. Listing a folder again triggers a fresh shallow copy so the proxy is always up to date.</p>
 
-<h2><span class="n">02</span> How the Cloud Filter API works</h2>
-<div class="panel">
-<div class="kv">
-  <dt>Sync root</dt><dd>A directory we register with Windows (<code>CfRegisterSyncRoot</code> / <code>StorageProviderSyncRootManager</code>). Explorer shows it with our branding and a status column.</dd>
-  <dt>Placeholder</dt><dd>A file/dir entry with metadata but no data on disk ("dehydrated"). Costs ~0 bytes. Created with <code>CfCreatePlaceholders</code>.</dd>
-  <dt>Hydration</dt><dd>On first read, Windows fires <code>FETCH_DATA</code>; we supply bytes via <code>CfExecute(TRANSFER_DATA)</code>. The file becomes "available offline" until dehydrated.</dd>
-  <dt>On-demand population</dt><dd>Subdirectories can themselves be placeholders; <code>FETCH_PLACEHOLDERS</code> fires when the user browses into one, so we only materialize the tree lazily.</dd>
-  <dt>Callbacks</dt><dd>We connect with <code>CfConnectSyncRoot</code> and register a callback table. Windows drives us; we never poll.</dd>
-  <dt>Pin / hydration state</dt><dd>Users (or we) can pin files to keep them local, or free up space to re-dehydrate.</dd>
+<h2><span class="n">02</span> How cloud-sync placeholders work (per OS)</h2>
+<p class="lead">Every target OS has a native "files on demand" facility. bosync's core is platform-agnostic; a thin per-platform crate adapts these primitives behind one trait.</p>
+<div class="scroll">
+<table>
+<thead><tr><th>Concept</th><th>Windows</th><th>Linux</th><th>macOS</th></tr></thead>
+<tbody>
+<tr><td>Mount / sync root</td><td><code>CfRegisterSyncRoot</code> + <code>CfConnectSyncRoot</code></td><td>FUSE mount of the proxy folder</td><td>File Provider extension domain</td></tr>
+<tr><td>Placeholder (cloud-only)</td><td><code>CfCreatePlaceholders</code>, dehydrated</td><td>sparse entry, fetch on <code>open()/read()</code></td><td>materialize-on-demand item</td></tr>
+<tr><td>Hydration trigger</td><td><code>FETCH_DATA</code> callback</td><td><code>open()</code> / <code>read()</code> handler</td><td><code>fetchContents</code> request</td></tr>
+<tr><td>Browse / list</td><td><code>FETCH_PLACEHOLDERS</code></td><td><code>readdir()</code></td><td>enumerator</td></tr>
+<tr><td>Re-dehydrate (free space)</td><td><code>CfDehydratePlaceholder</code></td><td>drop cached contents, keep stub</td><td>evict item contents</td></tr>
+</tbody>
+</table>
 </div>
-</div>
+<p class="muted">The proxy folder is the shallow clone; the OS layer projects it as cloud-only and calls us back when a file is actually needed.</p>
 
 <h2><span class="n">03</span> Architecture</h2>
 <div class="flow">┌──────────────────────────────────────────────────────────────┐
-│  Windows Explorer / any app that opens a file                  │
+│  File manager / any app that lists or opens a file             │
 └───────────────┬──────────────────────────────────────────────┘
-                │  read() / browse()  (NTFS reparse points)
+                │  list() / open() / save()
 ┌───────────────▼──────────────────────────────────────────────┐
-│  <b>Cloud Filter (cldapi.dll)</b>  — kernel+user shim, OS-provided    │
+│  <b>OS cloud-sync layer</b>   Win: Cloud Filter · Linux: FUSE · mac: FileProvider │
 └───────────────┬──────────────────────────────────────────────┘
-        callbacks│ <b>FETCH_DATA · FETCH_PLACEHOLDERS · NOTIFY_*</b>
+        callbacks│ <b>fetch-data · fetch-placeholders · notify-save</b>
 ┌───────────────▼──────────────────────────────────────────────┐
-│  <b>bosync Provider</b>  (our Rust process)                          │
-│  ┌────────────┬──────────────┬───────────────┬─────────────┐  │
-│  │ sync-root  │ placeholder  │  hydration    │  change      │  │
-│  │ register   │ projector    │  handler      │  watcher     │  │
-│  └────────────┴──────┬───────┴───────┬───────┴──────┬──────┘  │
-└─────────────────────┬┴───────────────┴──────────────┴─────────┘
-            tree/blob │ read           │ stage+commit  │ status
-┌─────────────────────▼────────────────▼───────────────▼────────┐
-│  <b>Git backend</b>  (<span class="g">gix</span> — pure Rust)   objects · trees · commits     │
+│  <b>bosync per-platform crate</b>  (win / linux / mac sync logic)     │
 └───────────────┬──────────────────────────────────────────────┘
-                │  fetch / push   (optional, later milestone)
+                │  one trait
+┌───────────────▼──────────────────────────────────────────────┐
+│  <b>bosync core</b>   proxy lifecycle · hydrate/dehydrate · idle engine │
+└───────────────┬──────────────────────────────────────────────┘
+   shallow clone │ refetch · commit · push · prune
+┌───────────────▼──────────────────────────────────────────────┐
+│  <b>Git backend</b>  (<span class="g">gix</span> — pure Rust)   on-disk proxy = shallow clone   │
+└───────────────┬──────────────────────────────────────────────┘
+                │  git over SSH/HTTP   fetch / push
 ┌───────────────▼──────────────────────────────────────────────┐
 │  <b>Remote</b>  (GitHub / bare repo / origin)                          │
 └──────────────────────────────────────────────────────────────┘</div>
@@ -117,28 +124,29 @@
 <table>
 <thead><tr><th>Layer</th><th>Crate / API</th><th>Purity</th><th>Notes</th></tr></thead>
 <tbody>
-<tr><td>Cloud Filter bindings</td><td><code>windows</code> (<code>Win32::Storage::CloudFilters</code>)</td><td>Pure-Rust generated FFI</td><td>Official Microsoft bindings. Raw but complete; <code>unsafe</code> calls into the OS DLL. No C/C++ build step.</td></tr>
-<tr><td>Cloud Filter (ergonomic)</td><td><code>cloud-filter</code></td><td>Safe Rust wrapper</td><td>Maintained <code>cloud-filter-rs</code> fork of ok-nick's <code>wincs</code>. Gives a typed callback model. <b>Candidate primary path</b> — fall back to raw <code>windows</code> if it's missing a feature.</td></tr>
-<tr><td>Git backend</td><td><code>gix</code> (gitoxide)</td><td>100% pure Rust</td><td>No libgit2 / no C. Reads trees &amp; blobs, writes objects/commits, refs. Optional fallback: <code>git2</code> (libgit2 — not pure Rust).</td></tr>
-<tr><td>Sync-root registration</td><td><code>windows</code> (WinRT <code>StorageProviderSyncRootManager</code>)</td><td>Pure-Rust FFI</td><td>Modern registration path (shell integration, custom states/columns).</td></tr>
-<tr><td>Async runtime</td><td><code>tokio</code></td><td>Pure Rust</td><td>Hydration is I/O bound; serve callbacks off the OS thread.</td></tr>
-<tr><td>Logging / CLI</td><td><code>tracing</code>, <code>clap</code></td><td>Pure Rust</td><td>Observability + a small control CLI (<code>bosync mount &lt;repo&gt; &lt;path&gt;</code>).</td></tr>
+<tr><td>Git backend + shallow clone</td><td><code>gix</code> (gitoxide)</td><td>100% pure Rust</td><td>No libgit2 / no C. <code>prepare_clone(...).with_shallow(DepthAtRemote(1))</code>, fetch, commit, push, prune. Optional fallback: <code>git2</code> (libgit2 — not pure Rust).</td></tr>
+<tr><td>Transport</td><td><code>gix</code> SSH + HTTP transports</td><td>Pure Rust path preferred</td><td>Git over SSH <em>or</em> HTTP(S) to the remote — whichever the URL specifies. Fall back to invoking system <code>ssh</code> only if a key/agent feature is missing.</td></tr>
+<tr><td>Windows mount</td><td><code>cloud-filter</code> / raw <code>windows</code></td><td>Safe wrapper / pure-Rust FFI</td><td>Cloud Filter API. <code>cloud-filter-rs</code> is the candidate primary path; raw <code>windows</code> bindings are the proven fallback.</td></tr>
+<tr><td>Linux mount</td><td><code>fuser</code> (FUSE)</td><td>Pure Rust</td><td>Mount the proxy folder; serve <code>readdir</code>/<code>open</code>/<code>read</code> from the shallow clone, hydrate on access.</td></tr>
+<tr><td>macOS mount</td><td>File Provider (objc FFI)</td><td>Pure-Rust FFI</td><td>File Provider extension over the proxy; same trait as the other two platforms.</td></tr>
+<tr><td>Async runtime</td><td><code>tokio</code></td><td>Pure Rust</td><td>Hydration, refetch and the idle engine are I/O bound; serve callbacks off the OS thread.</td></tr>
+<tr><td>Logging</td><td><code>tracing</code></td><td>Pure Rust</td><td>Observability across the proxy lifecycle and idle engine. (A custom control CLI is deferred for now — invoked directly with a config/env for the repo URL.)</td></tr>
 </tbody>
 </table>
 </div>
-<p class="muted">Net: everything is Rust source. The only non-Rust thing in the dependency chain is the Windows-provided <code>cldapi.dll</code> itself, which is unavoidable — it <em>is</em> the OS feature we're targeting.</p>
+<p class="muted">Net: everything is Rust source. The only non-Rust pieces are the OS-provided facilities themselves (Cloud Filter, FUSE, File Provider) — they <em>are</em> the features we're targeting. Per repo policy, any non-Rust dependency we pull in is a candidate to swap for a Rust one.</p>
 
-<h2><span class="n">05</span> Mapping OS callbacks → Git operations</h2>
+<h2><span class="n">05</span> Mapping OS events → bosync actions</h2>
 <div class="scroll">
 <table>
-<thead><tr><th>Cloud Filter event</th><th>When</th><th>bosync does</th></tr></thead>
+<thead><tr><th>Event</th><th>When</th><th>bosync does</th></tr></thead>
 <tbody>
-<tr><td><code>FETCH_PLACEHOLDERS</code></td><td>User browses into a folder</td><td>Read the corresponding Git <b>tree</b>, emit one placeholder per entry (file size = blob size, dir = sub-placeholder).</td></tr>
-<tr><td><code>FETCH_DATA</code></td><td>User opens / reads a file</td><td>Resolve path → tree entry → blob OID, stream blob bytes back via <code>TRANSFER_DATA</code> (chunked).</td></tr>
-<tr><td><code>CANCEL_FETCH_DATA</code></td><td>User aborts a large open</td><td>Stop streaming, free the in-flight read.</td></tr>
-<tr><td><code>NOTIFY_FILE_OPEN/CLOSE_COMPLETION</code></td><td>App opens then closes a file</td><td>Track dirty state; on close-after-write, mark file for commit.</td></tr>
-<tr><td><code>NOTIFY_DELETE / NOTIFY_RENAME</code></td><td>User deletes/moves in Explorer</td><td>Stage equivalent change (<code>git rm</code> / rename) into the working index.</td></tr>
-<tr><td>local write (full file)</td><td>App saves a modified file</td><td>Convert placeholder → full file, hash new content, stage blob, commit.</td></tr>
+<tr><td>list folder</td><td>User browses into a directory</td><td>Trigger a fresh shallow copy of the repo, then serve the updated proxy folder's entries as cloud-only placeholders.</td></tr>
+<tr><td>open / read file</td><td>User opens a file</td><td>Re-sync the shallow copy, hydrate the requested file from the proxy, then let the open proceed.</td></tr>
+<tr><td>save file</td><td>App writes a modified file</td><td>Sync the change into the proxy, <code>commit</code>, <code>push</code> to the remote, then return to idle.</td></tr>
+<tr><td>idle tick — refetch</td><td>Periodically while idle</td><td>Re-fetch the repo (shallow) to stay current with origin.</td></tr>
+<tr><td>idle tick — prune</td><td>Periodically while idle</td><td>Prune history to keep the proxy's git size down.</td></tr>
+<tr><td>idle tick — dehydrate</td><td>File untouched for a few minutes</td><td>Mark it cloud-only / remote again, freeing local bytes.</td></tr>
 </tbody>
 </table>
 </div>
@@ -146,123 +154,129 @@
 <h2><span class="n">06</span> Key data flows</h2>
 <div class="grid2">
 <div class="panel">
-<h3>Read (hydration)</h3>
+<h3>Open (hydration)</h3>
 <div class="flow" style="font-size:12px">open file.rs
-  <b>→</b> OS: FETCH_DATA(path,off,len)
-  <b>→</b> resolve path in HEAD tree
-  <b>→</b> gix: read blob @ OID
-  <span class="g">→ CfExecute(TRANSFER_DATA)</span>
-  <b>→</b> Explorer shows "available"</div>
+  <b>→</b> OS: fetch-data(path)
+  <b>→</b> refresh shallow clone
+  <b>→</b> resolve path in proxy
+  <span class="g">→ hydrate file bytes</span>
+  <b>→</b> open proceeds</div>
 </div>
 <div class="panel">
-<h3>Write (commit-back)</h3>
+<h3>Save (commit + push)</h3>
 <div class="flow" style="font-size:12px">save file.rs
-  <b>→</b> OS: NOTIFY_CLOSE (dirty)
-  <b>→</b> read full file from disk
-  <b>→</b> gix: write blob + tree
-  <span class="g">→ commit on branch</span>
-  <b>→</b> convert back to placeholder</div>
+  <b>→</b> OS: notify-save
+  <b>→</b> sync change into proxy
+  <b>→</b> gix: commit
+  <span class="g">→ push origin (ssh)</span>
+  <b>→</b> back to idle</div>
 </div>
 </div>
 <div class="panel">
-<h3>Remote pull (later)</h3>
-<div class="flow" style="font-size:12px">bosync pull  <b>→</b>  gix fetch origin  <b>→</b>  diff old HEAD vs new HEAD  <b>→</b>  for each change: update / create / delete placeholder  <b>→</b>  conflicting local edits ⇒ surface as <span class="b">.conflict</span> copies</div>
+<h3>Idle engine</h3>
+<div class="flow" style="font-size:12px">every interval  <b>→</b>  gix fetch (shallow) to stay current  <b>→</b>  prune history to keep proxy small  <b>→</b>  for each file idle &gt; N min: <span class="b">mark cloud-only</span>  <b>→</b>  on next directory listing: re-trigger shallow copy and serve fresh proxy</div>
 </div>
 
 <h2><span class="n">07</span> Milestones</h2>
 <ol class="timeline">
 <li>
   <h3>Spike &amp; scaffold</h3>
-  <p class="goal">GOAL: a registered sync root that shows up in Explorer.</p>
-  <p>Cargo workspace, pick <code>cloud-filter</code> vs raw <code>windows</code> via a throwaway spike, register + connect a sync root over an empty folder, log every callback. Prove the plumbing before any Git.</p>
+  <p class="goal">GOAL: a registered cloud-sync mount that shows up in the file manager.</p>
+  <p>Cargo workspace with a platform crate per OS behind one mount trait. Pick the Windows path (<code>cloud-filter</code> vs raw <code>windows</code>) via a throwaway spike; mount an empty proxy folder and log every callback. Prove the plumbing before any Git.</p>
 </li>
 <li>
-  <h3>Read-only Git mount</h3>
-  <p class="goal">GOAL: browse a real repo's HEAD in Explorer; open files; bytes come from Git.</p>
-  <p>Project a commit tree into placeholders (lazy via <code>FETCH_PLACEHOLDERS</code>), implement <code>FETCH_DATA</code> from <code>gix</code> blobs with chunked transfer + cancel. This is the headline demo.</p>
+  <h3>Shallow-clone proxy, read-only</h3>
+  <p class="goal">GOAL: browse a real repo over SSH or HTTP; open files; bytes come from the shallow clone.</p>
+  <p>Shallow-clone the repo (<code>gix</code>, depth 1) into the per-user temp proxy, project it as cloud-only placeholders, and hydrate on open. Listing re-triggers a fresh shallow copy. This is the headline demo.</p>
 </li>
 <li>
-  <h3>Write-back to Git</h3>
-  <p class="goal">GOAL: edit a file in the drive → it becomes a commit.</p>
-  <p>Handle dirty-close, deletes, renames; stage and commit through <code>gix</code>; re-dehydrate to placeholder. Single local branch, no remote yet.</p>
+  <h3>Write-back: commit &amp; push</h3>
+  <p class="goal">GOAL: edit a file in the drive → it becomes a commit pushed to origin.</p>
+  <p>On save, sync the change into the proxy, commit through <code>gix</code>, and push over SSH or HTTP; then return to idle. Single branch.</p>
 </li>
 <li>
-  <h3>Remote sync</h3>
-  <p class="goal">GOAL: <code>pull</code>/<code>push</code> reconcile the drive with origin.</p>
-  <p>Fetch, diff HEADs, re-project changed paths, push local commits. Status column reflects synced/modified/conflict.</p>
+  <h3>Idle engine</h3>
+  <p class="goal">GOAL: stay current and stay small without user action.</p>
+  <p>Background ticks: periodic shallow re-fetch, history pruning to bound proxy size, and re-dehydration of files idle for a few minutes. Listing always serves a freshly synced proxy.</p>
 </li>
 <li>
-  <h3>Conflicts &amp; polish</h3>
-  <p class="goal">GOAL: it doesn't lose data when two sides edit.</p>
-  <p>Conflict surfacing (side-by-side <code>.conflict</code> files), branding/icon, basic settings, graceful unmount.</p>
+  <h3>Cross-platform &amp; polish</h3>
+  <p class="goal">GOAL: the same core runs on Windows, Linux and macOS.</p>
+  <p>Fill in the Linux (FUSE) and macOS (File Provider) platform crates against the shared trait, conflict surfacing for diverged edits, branding/icon, graceful unmount.</p>
 </li>
 </ol>
-<p class="muted"><b>POC stops at M2 (read + write-back works end-to-end).</b> M3–M4 are stretch goals shown for direction.</p>
+<p class="muted"><b>POC stops at M3 (shallow-clone mount + commit/push + idle engine on one platform).</b> M4 (full cross-platform parity + polish) is the stretch goal shown for direction.</p>
 
 <h2><span class="n">08</span> Scope for the POC</h2>
 <div class="grid2">
 <div class="panel">
 <h3>In scope</h3>
 <ul>
-<li><span class="tag in">IN</span> Single local Git repo as backend</li>
-<li><span class="tag in">IN</span> Lazy placeholder projection of HEAD</li>
-<li><span class="tag in">IN</span> On-demand hydration from blobs</li>
-<li><span class="tag in">IN</span> Local edit → commit</li>
-<li><span class="tag in">IN</span> CLI: <code>bosync mount &lt;repo&gt; &lt;path&gt;</code></li>
+<li><span class="tag in">IN</span> Shallow clone over SSH or HTTP as on-disk proxy</li>
+<li><span class="tag in">IN</span> Cloud-only placeholder projection of the proxy</li>
+<li><span class="tag in">IN</span> Hydrate-on-open, re-sync on listing</li>
+<li><span class="tag in">IN</span> Save → commit → push to origin</li>
+<li><span class="tag in">IN</span> Idle engine: refetch · prune · dehydrate</li>
 </ul>
 </div>
 <div class="panel">
 <h3>Out of scope (POC)</h3>
 <ul>
-<li><span class="tag out">OUT</span> Multi-user / real-time collab</li>
+<li><span class="tag out">OUT</span> Custom <code>bosync</code> control CLI (mount/unmount/status) — deferred</li>
+<li><span class="tag out">OUT</span> Full parity across all three OSes at once</li>
 <li><span class="tag out">OUT</span> Merge-conflict UI / auto-merge</li>
 <li><span class="tag out">OUT</span> LFS, submodules, huge-file streaming tuning</li>
-<li><span class="tag out">OUT</span> MSI installer / code signing</li>
+<li><span class="tag out">OUT</span> Installer / code signing / packaging</li>
 <li><span class="tag out">OUT</span> Encryption at rest</li>
 </ul>
 </div>
 </div>
 
 <h2><span class="n">09</span> Proposed project layout</h2>
+<p class="lead">Per repo convention, dependencies point inward (core knows nothing about how it's mounted) and platform-specific sync logic lives in its own crate behind a trait the core declares.</p>
 <div class="flow">bosync/
 ├─ Cargo.toml            <span class="muted">workspace</span>
 ├─ crates/
-│  ├─ bosync-cli/      <b>clap CLI: mount / unmount / status</b>
-│  ├─ bosync-cf/       <b>Cloud Filter: register, connect, callbacks</b>
-│  ├─ bosync-git/      <b>gix wrapper: tree→placeholders, blob read, commit</b>
-│  └─ bosync-core/     <b>sync engine tying CF callbacks ↔ git</b>
+│  ├─ bosync-core/     <b>proxy lifecycle, hydrate/dehydrate, idle engine; declares Mount trait</b>
+│  ├─ bosync-git/      <b>gix wrapper: shallow clone, fetch, commit, push, prune (SSH or HTTP)</b>
+│  ├─ bosync-win/      <b>Windows sync logic — Cloud Filter; impl Mount</b>
+│  ├─ bosync-linux/    <b>Linux sync logic — FUSE; impl Mount</b>
+│  └─ bosync-mac/      <b>macOS sync logic — File Provider; impl Mount</b>
 └─ PLAN.html             <span class="muted">this document</span></div>
+<p class="muted">Each platform crate is compiled in only on its target (<code>#[cfg(target_os = ...)]</code> / per-platform workspace members), but all implement the same <code>Mount</code> trait so <code>bosync-core</code> stays platform-agnostic.</p>
 
 <h2><span class="n">10</span> Risks &amp; open questions</h2>
-<div class="risk"><b>Cloud Filter wrapper maturity.</b> The <code>cloud-filter</code> crate may not expose every callback we need. Mitigation: M0 spike validates it early; raw <code>windows</code> bindings are the proven fallback.</div>
-<div class="risk"><b>Registration friction.</b> Sync-root registration can require running as a packaged app / specific shell registration on Win11. We'll start with the classic <code>CfRegisterSyncRoot</code> path and document any manifest needs.</div>
-<div class="risk"><b>Identity mismatch.</b> Git tracks content trees; the filesystem tracks paths + mutable bytes. Mapping placeholder file-identity to blob OIDs across edits/renames needs a small local mapping store (path ↔ OID ↔ CF file-id).</div>
-<div class="risk"><b>Write semantics.</b> Cloud Filter expects us to "upload" on change; we instead commit. Deciding <em>when</em> to commit (every close? debounced?) is a design choice — POC: commit on dirty-close, one commit per save.</div>
-<div class="risk"><b>Binary/large files.</b> Hydration streams in chunks; very large blobs need bounded memory. POC targets text-ish repos; note the limit rather than solve it.</div>
+<div class="risk"><b>Three platform backends.</b> Cloud Filter, FUSE and File Provider differ in capability and registration. Mitigation: one <code>Mount</code> trait, ship one platform end-to-end (M0–M3) before fanning out in M4.</div>
+<div class="risk"><b>Re-sync on every open/list.</b> Refreshing the shallow clone on each open and each directory listing can be costly. Mitigation: debounce/cache the shallow fetch, only re-fetch when stale beyond a threshold.</div>
+<div class="risk"><b>Remote auth (SSH/HTTP).</b> A background process needs credentials: SSH keys/agent, or HTTP(S) tokens/credential helper. Mitigation: prefer <code>gix</code>'s pure-Rust transports; fall back to the system <code>ssh</code> or a credential helper as needed.</div>
+<div class="risk"><b>Pruning vs. shallow depth.</b> Keeping the proxy small (prune history) while staying able to commit/push needs care so we don't corrupt the shallow clone. POC: depth-1 clone, re-clone rather than deep-prune if needed.</div>
+<div class="risk"><b>Write semantics.</b> Deciding <em>when</em> to commit/push (every save? debounced?) is a design choice — POC: commit + push on save, one commit per save.</div>
+<div class="risk"><b>Binary/large files.</b> Hydration must bound memory for very large blobs. POC targets text-ish repos; note the limit rather than solve it.</div>
 
 <h2><span class="n">11</span> Dev environment</h2>
 <div class="panel">
 <div class="kv">
-  <dt>OS</dt><dd>Windows 11 (Cloud Filter API present since Win10 1709; we target 11).</dd>
-  <dt>Toolchain</dt><dd>Rust stable, MSVC toolchain (<code>x86_64-pc-windows-msvc</code>).</dd>
-  <dt>Privileges</dt><dd>Sync-root registration may need elevated first-run; hydration runs unprivileged.</dd>
-  <dt>Test asset</dt><dd>A small sample Git repo (text files + a couple of nested folders) to mount.</dd>
+  <dt>OS</dt><dd>Primary dev + first platform target, then Linux (FUSE) and macOS (File Provider).</dd>
+  <dt>Toolchain</dt><dd>Rust stable; per-target toolchains (<code>x86_64-pc-windows-msvc</code>, Linux GNU, Apple Silicon).</dd>
+  <dt>Backend</dt><dd>A Git remote reachable over SSH or HTTP(S) (GitHub or a bare repo), with the matching credentials (key/agent or token).</dd>
+  <dt>Privileges</dt><dd>Mount registration may need elevated first-run; hydration runs unprivileged.</dd>
+  <dt>Test asset</dt><dd>A small sample Git repo (text files + a couple of nested folders) to mount over SSH or HTTP.</dd>
 </div>
 </div>
 
 <hr>
 <h2 style="margin-top:0"><span class="n">→</span> What I need from you before building</h2>
 <ul>
-<li><b>Green-light the M0→M2 scope</b> (read-only mount + write-back) as the POC finish line?</li>
-<li><b>Backend repo:</b> point bosync at an existing repo, or have it create a sample one?</li>
-<li><b>Wrapper preference:</b> let me default to the <code>cloud-filter</code> crate and fall back to raw <code>windows</code> if needed — OK?</li>
+<li><b>Green-light the M0→M3 scope</b> (shallow-clone mount + commit/push + idle engine on one platform) as the POC finish line?</li>
+<li><b>First platform:</b> which OS do we take end-to-end first — Windows, Linux or macOS?</li>
+<li><b>Backend repo:</b> point bosync at an existing SSH or HTTP(S) remote, or have it create a sample one?</li>
 </ul>
 
 <footer>
 bosync POC plan · drafted for review · References:
 <a href="https://learn.microsoft.com/en-us/windows/win32/api/_cloudapi/">Cloud Filter API (Microsoft Learn)</a> ·
-<a href="https://microsoft.github.io/windows-docs-rs/doc/windows/Win32/Storage/CloudFilters/">windows-rs CloudFilters</a> ·
 <a href="https://crates.io/crates/cloud-filter">cloud-filter crate</a> ·
+<a href="https://crates.io/crates/fuser">fuser (FUSE)</a> ·
 <a href="https://github.com/GitoxideLabs/gitoxide">gitoxide / gix</a>
 </footer>
 
