@@ -1,6 +1,6 @@
 # bosync
 
-Once upton a time called bofinc disk sync, it was part of a git clone thing i was building. 
+Once upton a time called bofink disk sync, it was part of a git clone thing i was building. 
 I had 12 000 dreams and equally as many projects trying to build parts of it. 
 
 Im still working on it but people might want this stuff for future use. Who knows, people might really use it.
