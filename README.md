@@ -7,6 +7,11 @@ Im still working on it but people might want this stuff for future use. Who know
 
 I have had AI rewrite alot of this, and change the structure. This does not look like the original project i once created many months ago.
 
+Ill add alot of this was broken when i let AI take care of it so it will probably still be a bit broken.
+
+I tried to not have any local proxies, but that didnt work now im rolling back...
+
+When i started this i used windows, now i have linux <_< So much dead code.
 
 ## Original text
 
