@@ -54,7 +54,9 @@ impl CloudSync for WindowsCloudSync {
     fn dehydrate(&self, abs: &Path) {
         // Best-effort: convert to an in-sync placeholder so it can be freed; full Cloud Filter
         // dehydration (CfDehydratePlaceholder) is a later refinement of the idle engine.
-        if let Ok(mut ph) = Placeholder::open(abs) {
+        // CfSetInSyncState needs WRITE_DATA/WRITE_DAC access (see `mark_path_in_sync`), so the
+        // handle must be opened with write access or the call fails with ACCESS_DENIED.
+        if let Ok(mut ph) = Placeholder::options().write_access().open(abs) {
             let _ = ph.mark_in_sync(true, None);
         }
     }
@@ -67,9 +69,15 @@ impl CloudSync for WindowsCloudSync {
 /// Mark a single on-disk file or directory as an in-sync placeholder so Explorer shows it
 /// as synced (green check) instead of perpetually "pending". Best-effort.
 fn mark_path_in_sync(abs: &Path, is_dir: bool) {
+    // CfSetInSyncState and CfConvertToPlaceholder both require WRITE_DATA (or WRITE_DAC) access
+    // on the handle — without it they fail with ERROR_CLOUD_FILE_ACCESS_DENIED. The handle must
+    // therefore be opened *with write access*; a plain (no-flag) oplock handle or a read-only
+    // `File::open` handle silently fails, which left every file stuck showing the "syncing"
+    // overlay forever.
+    //
     // Already a placeholder (projected file/dir, or a previously-converted one): just set the
     // in-sync state — idempotent.
-    if let Ok(mut ph) = Placeholder::open(abs) {
+    if let Ok(mut ph) = Placeholder::options().write_access().open(abs) {
         if ph.mark_in_sync(true, None).is_ok() {
             return;
         }
@@ -82,9 +90,10 @@ fn mark_path_in_sync(abs: &Path, is_dir: bool) {
             return;
         }
     }
-    // Full file that can't be opened as a placeholder: convert via a plain file handle.
+    // Full file that can't be opened via the oplock path: convert via a writable file handle.
+    // It must be opened for write (read-only handles fail conversion with ACCESS_DENIED).
     if !is_dir {
-        if let Ok(file) = std::fs::File::open(abs) {
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(abs) {
             let mut ph: Placeholder = file.into();
             let _ = ph.convert_to_placeholder(ConvertOptions::default().mark_in_sync(), None);
         }
