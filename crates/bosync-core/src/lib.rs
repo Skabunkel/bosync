@@ -15,10 +15,12 @@
 mod mount;
 mod proxy;
 mod reconcile;
+mod schedule;
 
 pub use mount::{CloudSync, NullCloudSync, ProxyState};
 pub use proxy::{repo_name, Proxy, DEFAULT_DEPTH};
 pub use reconcile::{reconcile_path, to_git_path, Reconciled};
+pub use schedule::{SyncPolicy, SyncScheduler, Tick};
 
 #[cfg(test)]
 mod testutil {

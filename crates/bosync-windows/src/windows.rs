@@ -15,7 +15,7 @@ use cloud_filter::root::{
 };
 use cloud_filter::utility::{FileTime, WriteAt};
 
-use bosync_core::{CloudSync, to_git_path};
+use bosync_core::{CloudSync, ProxyState, to_git_path};
 use bosync_git::GitBackend;
 
 /// Cloud Filter writes must be 4096-aligned except at end-of-file. 64 KiB chunks.
@@ -58,6 +58,16 @@ impl CloudSync for WindowsCloudSync {
         // handle must be opened with write access or the call fails with ACCESS_DENIED.
         if let Ok(mut ph) = Placeholder::options().write_access().open(abs) {
             let _ = ph.mark_in_sync(true, None);
+        }
+    }
+
+    fn mark_state(&self, root: &Path, abs: &Path, state: ProxyState) {
+        match state {
+            ProxyState::Synced => self.mark_in_sync(root, abs),
+            ProxyState::Remote => self.dehydrate(abs),
+            // Committed but not yet pushed: show the "sync pending" overlay so the user can see the
+            // change is still on its way to the remote (the batched push clears it).
+            ProxyState::Local => mark_path_syncing(abs),
         }
     }
 }
@@ -118,30 +128,31 @@ fn mark_in_sync_up(root: &Path, abs: &Path) {
     }
 }
 
-/// Mark a just-renamed item in-sync: the item itself (its whole subtree if it's a folder) and
-/// every ancestor directory up to the sync root.
-fn mark_renamed_in_sync(root: &Path, abs: &Path) {
-    let is_dir = std::fs::metadata(abs).map(|m| m.is_dir()).unwrap_or(false);
-    if is_dir {
-        mark_tree_in_sync(abs);
-    } else {
-        mark_path_in_sync(abs, false);
+/// Mark a file as a placeholder that is *not* in sync, so Explorer shows the "sync pending"
+/// (syncing) overlay until the batched push confirms it on the remote. Best-effort. Directories
+/// take their overlay from their children, so they're skipped here.
+fn mark_path_syncing(abs: &Path) {
+    if std::fs::metadata(abs).map(|m| m.is_dir()).unwrap_or(false) {
+        return;
     }
-    let mut current = abs.parent();
-    while let Some(dir) = current {
-        if !dir.starts_with(root) {
-            break;
+    // Already a placeholder: just clear the in-sync bit. Otherwise convert it to a placeholder
+    // without marking in-sync. Both paths need a write handle (see `mark_path_in_sync`).
+    if let Ok(mut ph) = Placeholder::options().write_access().open(abs) {
+        if ph.mark_in_sync(false, None).is_ok() {
+            return;
         }
-        mark_path_in_sync(dir, true);
-        if dir == root {
-            break;
-        }
-        current = dir.parent();
+        let _ = ph.convert_to_placeholder(ConvertOptions::default(), None);
+        return;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(abs) {
+        let mut ph: Placeholder = file.into();
+        let _ = ph.convert_to_placeholder(ConvertOptions::default(), None);
     }
 }
 
 /// Recursively mark every existing file and directory under `root` as an in-sync placeholder.
-/// Run on mount to clear stale "pending sync" overlays left from a previous session.
+/// Run on mount to clear stale "pending sync" overlays left from a previous session. The git
+/// store (`.git`) is skipped — it isn't part of the projected tree and must stay invisible.
 pub fn mark_tree_in_sync(root: &Path) {
     mark_path_in_sync(root, true);
     let mut stack = vec![root.to_path_buf()];
@@ -152,12 +163,33 @@ pub fn mark_tree_in_sync(root: &Path) {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue; // never touch the local git copy's store
+            }
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
             mark_path_in_sync(&path, is_dir);
             if is_dir {
                 stack.push(path);
             }
         }
+    }
+}
+
+/// Hide a directory (the proxy's `.git`) from Explorer by setting the hidden + system attributes,
+/// so the local git store doesn't show up in the mounted folder. Best-effort.
+pub fn hide_dir(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is a valid null-terminated UTF-16 path that outlives the call.
+    let ok = unsafe {
+        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
+    };
+    if ok == 0 {
+        tracing::debug!(?path, "could not hide .git (non-fatal)");
     }
 }
 
@@ -247,7 +279,7 @@ impl SyncRoot {
 /// the CLI's filesystem watcher via [`bosync_core::reconcile_path`].
 pub struct BosyncFilter {
     git: GitBackend,
-    /// Absolute path of the sync root (the proxy folder).
+    /// Absolute path of the sync root (the proxy folder = the local git working copy).
     root: PathBuf,
 }
 
@@ -394,24 +426,29 @@ impl SyncFilter for BosyncFilter {
             (to_git_path(&self.root, &old), to_git_path(&self.root, &new))
         {
             if !old_git.is_empty() && !new_git.is_empty() && old_git != new_git {
-                match self.git.rename_in_git(&old_git, &new_git) {
+                let committed = match self.git.rename_in_git(&old_git, &new_git) {
                     // `old` was tracked: a proper git rename happened (file or whole folder).
-                    Ok(true) => {}
+                    Ok(true) => true,
                     // `old` wasn't committed yet (a freshly created file renamed before the
                     // watcher saw it). Commit `new` from disk so git is consistent NOW.
-                    Ok(false) => {
-                        if let Ok(content) = std::fs::read(&new) {
-                            let _ = self.git.commit_upsert(
-                                &new_git,
-                                &content,
-                                &format!("Add {new_git}"),
-                            );
-                        }
+                    Ok(false) => match std::fs::read(&new) {
+                        Ok(content) => self
+                            .git
+                            .commit_upsert(&new_git, &content, &format!("Add {new_git}"))
+                            .is_ok(),
+                        Err(_) => false,
+                    },
+                    Err(e) => {
+                        tracing::warn!(%old_git, %new_git, "git rename failed: {e:#}");
+                        false
                     }
-                    Err(e) => tracing::warn!(%old_git, %new_git, "git rename failed: {e:#}"),
+                };
+                // Don't push from here — pushing is paced centrally by the CLI's scheduler (be
+                // nice to the remote). Just show the renamed item as "syncing"; the loop notices
+                // the proxy's HEAD moved, batches the push, and promotes the tree to Synced.
+                if committed {
+                    mark_path_syncing(&new);
                 }
-                // Clear the "pending sync" overlay on the renamed item right away.
-                mark_renamed_in_sync(&self.root, &new);
             }
         }
     }

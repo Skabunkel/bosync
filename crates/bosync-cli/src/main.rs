@@ -103,31 +103,58 @@ fn default_drive(remote: &str) -> PathBuf {
         .join(name)
 }
 
-/// How often the background loop runs `git fetch --depth=1` to keep the proxy current.
+/// How long writes must settle before the watcher reconciles a batch of changes into commits.
 #[cfg(windows)]
-const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// Run one background refresh tick: fetch the branch, and for every entry the remote changed,
-/// re-dehydrate it on the drive back to a cloud-only "remote" placeholder.
+/// How often the mount loop polls the scheduler and drains filesystem events.
+#[cfg(windows)]
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Whether `path` is inside the proxy's `.git` store. Changes there (our own commits) must be
+/// ignored by the write-back watcher, or every commit would trigger another commit forever.
+#[cfg(windows)]
+fn in_git_dir(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|c| c.as_os_str() == ".git")
+}
+
+/// Seed the jitter PRNG from wall-clock + pid so concurrent mounts don't fetch in lockstep.
+#[cfg(windows)]
+fn jitter_seed() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ ((std::process::id() as u64) << 32)
+}
+
+/// Run one background refresh: fetch the branch and, for every entry the remote changed, pull the
+/// new content into the proxy folder and mark it synced. Returns whether anything actually changed,
+/// so the scheduler can back off when the remote is quiet.
 #[cfg(windows)]
 fn refresh_tick(
     proxy: &mut bosync_core::Proxy,
     drive: &std::path::Path,
     branch: &str,
     cloud: &bosync_windows::WindowsCloudSync,
-) {
+) -> bool {
     use bosync_core::{CloudSync, ProxyState};
 
     match proxy.refresh_branch(branch) {
         Ok(changed) if !changed.is_empty() => {
-            tracing::info!(count = changed.len(), "remote advanced; re-dehydrating changed entries");
-            for rel in changed {
+            tracing::info!(count = changed.len(), "remote advanced; pulled changed entries");
+            for rel in &changed {
                 let abs = drive.join(rel.replace('/', "\\"));
-                cloud.mark_state(drive, &abs, ProxyState::Remote);
+                cloud.mark_state(drive, &abs, ProxyState::Synced);
             }
+            true
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("background refresh failed: {e:#}"),
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!("background refresh failed: {e:#}");
+            false
+        }
     }
 }
 
@@ -143,35 +170,43 @@ fn mount(
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use notify::{RecursiveMode, Watcher};
 
-    use bosync_core::{reconcile_path, CloudSync, Proxy, ProxyState, Reconciled};
-    use bosync_windows::{mark_tree_in_sync, BosyncFilter, SyncRoot, WindowsCloudSync};
+    use bosync_core::{
+        reconcile_path, CloudSync, Proxy, ProxyState, Reconciled, SyncPolicy, SyncScheduler, Tick,
+    };
+    use bosync_windows::{hide_dir, mark_tree_in_sync, BosyncFilter, SyncRoot, WindowsCloudSync};
 
-    // Shallow-clone the remote into the internal per-user proxy (the git backend). This is the
-    // "create a proxy" step — a thin shallow copy, not a full clone.
-    let mut proxy = Proxy::open_or_clone_in(&remote, &Proxy::proxy_dir(&remote), depth)
-        .with_context(|| format!("shallow-cloning {remote}"))?;
+    // Normalize the remote (handles `file://C:\…` on Windows) so clone/fetch/push agree.
+    let remote = bosync_git::normalize_remote(&remote);
+
+    // The mounted folder *is* the local git working copy (the proxy): a shallow clone with its
+    // own `.git`. Local changes are written here and synced from here to the remote. Re-mounting
+    // an existing folder reuses it.
+    let drive = into.unwrap_or_else(|| default_drive(&remote));
+    let mut proxy = Proxy::open_or_clone_in(&remote, &drive, depth)
+        .with_context(|| format!("preparing proxy at {drive:?} from {remote}"))?;
     let git = proxy.git().clone();
 
-    // The drive is the folder the user browses; it starts empty so every entry projects as a
-    // cloud-only "remote" placeholder.
-    let drive = into.unwrap_or_else(|| default_drive(&remote));
-    std::fs::create_dir_all(&drive).with_context(|| format!("creating drive folder {drive:?}"))?;
     // Canonicalize so the root matches the long-form paths the OS reports in callbacks, then
     // strip the `\\?\` verbatim prefix which Cloud Filter registration rejects.
     let drive = strip_verbatim(
         std::fs::canonicalize(&drive)
             .with_context(|| format!("canonicalizing drive folder {drive:?}"))?,
     );
+    // Hide the local git store so it doesn't show up in the mounted folder.
+    hide_dir(&drive.join(".git"));
 
     let sync_root = SyncRoot::register(PROVIDER, DISPLAY_NAME, VERSION, &drive)?;
+    // The filter only projects/hydrates and commits renames into the proxy; it never pushes.
+    // All remote traffic is paced centrally by the scheduler in the loop below (be nice to the
+    // remote), so a rename just commits locally and the loop notices HEAD moved.
     let filter = BosyncFilter::new(git.clone(), drive.clone());
     let _connection = sync_root.connect(&drive, filter)?;
 
-    // Clear any stale "pending sync" state from a previous session (especially folders).
+    // Clear any stale "pending sync" state from a previous session (skips `.git`).
     mark_tree_in_sync(&drive);
 
     let running = Arc::new(AtomicBool::new(true));
@@ -181,19 +216,23 @@ fn mount(
 
     let mode = if readonly { " (read-only)" } else { "" };
     println!("bosync mounted{mode}: {remote} -> {}", drive.display());
-    println!("Open it in Explorer. Entries start as cloud-only; Ctrl+C to unmount.");
+    println!("Open it in Explorer (the .git store is hidden). Press Ctrl+C to unmount.");
 
     // The platform seam: skips dehydrated placeholders and drives the Explorer overlays.
     let cloud = WindowsCloudSync;
-    let mut last_refresh = Instant::now();
+
+    // Paces all remote traffic: batches pushes and backs off / jitters fetches so we don't get
+    // rate-limited by a hosted remote (see `bosync_core::SyncScheduler`).
+    let mut scheduler = SyncScheduler::new(SyncPolicy::default(), Instant::now(), jitter_seed());
 
     if readonly {
-        // No write-back; just keep the proxy current in the background.
+        // No write-back; just keep the proxy current in the background, paced by the scheduler.
         while running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(300));
-            if last_refresh.elapsed() >= REFRESH_INTERVAL {
-                last_refresh = Instant::now();
-                refresh_tick(&mut proxy, &drive, &branch, &cloud);
+            std::thread::sleep(POLL_INTERVAL);
+            let now = Instant::now();
+            if let Tick::Fetch = scheduler.poll(now) {
+                let changed = refresh_tick(&mut proxy, &drive, &branch, &cloud);
+                scheduler.note_fetched(now, changed);
             }
         }
     } else {
@@ -208,44 +247,83 @@ fn mount(
             .watch(&drive, RecursiveMode::Recursive)
             .with_context(|| format!("watching {drive:?}"))?;
 
-        // Debounce: collect changed paths, reconcile each after a short quiet period.
+        // Debounce buffer for raw filesystem events.
         let mut pending: HashSet<PathBuf> = HashSet::new();
+        let mut last_event: Option<Instant> = None;
+        // Track the proxy's HEAD so we notice *any* new commit (a watcher reconcile here, or a
+        // rename committed by the filter) and pace its push centrally. Start in sync with what we
+        // cloned, so a freshly-mounted proxy owes the remote nothing.
+        let mut last_head = git.rev_id("HEAD");
+        let mut pushed_head = last_head.clone();
+
         while running.load(Ordering::SeqCst) {
-            match rx.recv_timeout(Duration::from_millis(300)) {
+            match rx.recv_timeout(POLL_INTERVAL) {
                 Ok(event) => {
                     for path in event.paths {
-                        pending.insert(path);
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    for path in pending.drain() {
-                        match reconcile_path(&git, &cloud, &drive, &path) {
-                            // Committed to the proxy → Local. Then push it to the remote; if that
-                            // lands (always, for a local target), promote to Synced so the
-                            // "syncing" overlay clears. A failed push (network remote) leaves it
-                            // Local and we retry next time.
-                            Ok(Reconciled::Committed) => {
-                                cloud.mark_state(&drive, &path, ProxyState::Local);
-                                match git.push(&remote) {
-                                    Ok(()) => cloud.mark_state(&drive, &path, ProxyState::Synced),
-                                    Err(e) => tracing::warn!(?path, "push failed (stays local): {e:#}"),
-                                }
-                            }
-                            Ok(Reconciled::Removed) => {
-                                if let Err(e) = git.push(&remote) {
-                                    tracing::warn!(?path, "push of removal failed: {e:#}");
-                                }
-                            }
-                            Ok(Reconciled::Unchanged) => {}
-                            Err(e) => tracing::warn!(?path, "reconcile failed: {e:#}"),
+                        // Ignore writes inside `.git` — those are our own commits; reconciling
+                        // them would loop forever.
+                        if !in_git_dir(&path) {
+                            pending.insert(path);
                         }
                     }
-                    if last_refresh.elapsed() >= REFRESH_INTERVAL {
-                        last_refresh = Instant::now();
-                        refresh_tick(&mut proxy, &drive, &branch, &cloud);
+                    last_event = Some(Instant::now());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+
+            let now = Instant::now();
+
+            // Once writes settle, reconcile each buffered path into a commit and show it as
+            // "syncing" (Local). The batched push below promotes the whole tree to Synced.
+            if !pending.is_empty() && last_event.is_none_or(|t| now.duration_since(t) >= DEBOUNCE) {
+                for path in pending.drain() {
+                    match reconcile_path(&git, &cloud, &drive, &path) {
+                        Ok(Reconciled::Committed) => {
+                            cloud.mark_state(&drive, &path, ProxyState::Local)
+                        }
+                        Ok(Reconciled::Removed | Reconciled::Unchanged) => {}
+                        Err(e) => tracing::warn!(?path, "reconcile failed: {e:#}"),
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                last_event = None;
+            }
+
+            // A new commit (from the reconcile above or a rename in the filter) arms/extends the
+            // push batch — exactly once per commit, regardless of where it came from.
+            let head = git.rev_id("HEAD");
+            if head != last_head {
+                scheduler.note_change(now);
+                last_head = head;
+            }
+
+            match scheduler.poll(now) {
+                Tick::Push => {
+                    if last_head != pushed_head {
+                        match git.push(&remote) {
+                            Ok(()) => {
+                                // Everything committed is now on the remote → the whole tree is
+                                // Synced (clears the "syncing" overlays in one shot).
+                                mark_tree_in_sync(&drive);
+                                pushed_head = last_head.clone();
+                                scheduler.note_pushed(now);
+                                tracing::info!("pushed batched changes to remote");
+                            }
+                            Err(e) => {
+                                tracing::warn!("batch push failed (will retry): {e:#}");
+                                scheduler.note_push_failed(now);
+                            }
+                        }
+                    } else {
+                        // Nothing genuinely unpushed (e.g. a no-op edit) — close out the batch.
+                        scheduler.note_pushed(now);
+                    }
+                }
+                Tick::Fetch => {
+                    let changed = refresh_tick(&mut proxy, &drive, &branch, &cloud);
+                    scheduler.note_fetched(now, changed);
+                }
+                Tick::Idle(_) => {}
             }
         }
     }

@@ -78,9 +78,7 @@ writes (which reproduce the git blob exactly) never produce spurious commits.
 
 ## Usage
 
-One command does everything: point `mount` at a remote and you get a live virtual drive.
-bosync shallow-clones the remote into an internal per-user proxy and projects *that* — you
-never run a `clone` or `fetch` yourself.
+One command does everything: point `mount` at a remote and you get a live, synced folder.
 
 ```powershell
 # Build
@@ -89,7 +87,7 @@ cargo build --release
 # (optional) create a sample repo to use as a fake remote
 cargo run -p bosync-cli -- sample --repo C:\tmp\bosync-repo
 
-# Mount a remote as a live drive (drive folder defaults to <cwd>\<repo-name>)
+# Mount a remote as a live folder (defaults to <cwd>\<repo-name>)
 cargo run -p bosync-cli -- mount --remote ssh://git@host/owner/repo.git
 cargo run -p bosync-cli -- mount --remote C:\tmp\bosync-repo --into C:\tmp\Mybosync
 
@@ -97,56 +95,73 @@ cargo run -p bosync-cli -- mount --remote C:\tmp\bosync-repo --into C:\tmp\Mybos
 cargo run -p bosync-cli -- mount --remote C:\tmp\bosync-repo --into C:\tmp\Mybosync --readonly
 ```
 
-Then open the drive folder in Explorer:
+The `--into` folder **is the local git working copy** (the *proxy*): a shallow clone of the
+remote, with its own `.git` (hidden in Explorer). bosync registers it as a Cloud Filter sync
+root so the entries get sync-state overlays. Then open it in Explorer:
 
-- The files from the remote's `HEAD` appear as cloud-only placeholders (free up ~0 bytes).
-- Open `hello.txt` → it hydrates from the git blob.
-- Edit and save a file → a commit lands in the proxy — unless mounted `--readonly`.
-- Delete a file → a removal commit lands.
-- In the background bosync keeps running `git fetch --depth=1` and re-dehydrates anything the
-  remote changed, so the folder stays a thin, always-current mirror.
+- Edit / create / delete / rename a file → bosync commits the change into the folder's `.git`
+  and **pushes it to the remote** (unless mounted `--readonly`). Pushes are **batched**, not
+  one-per-commit (see *Pacing the remote* below).
+- In the background it runs `git fetch --depth=1` and pulls anything the remote changed back
+  into the folder, staying shallow — so the folder is a thin, always-current mirror. Fetches
+  are **paced and jittered**, and yield while you still have unpushed work.
 
-An empty (no commits) remote mounts fine and shows an empty drive.
+Re-mounting the same folder reuses the existing clone. An empty (no commits) remote mounts fine
+and shows an empty folder. Press **Ctrl+C** to unmount and unregister the sync root.
 
-Press **Ctrl+C** in the terminal to unmount and unregister the sync root.
+## The proxy folder & sync states
 
-## Proxies & sync states
-
-A **proxy** is the internal **shallow clone** of the remote that the OS projects as the drive.
-It's created automatically by `mount` (depth `1` by default — just the current tree, the
-smallest possible; tune with `--depth`). You don't manage it directly.
+The **proxy** is the local git copy you browse: one folder, a shallow clone (depth `1` by
+default — just the current tree; tune with `--depth`), with a hidden `.git`. Local changes are
+written into this folder and synced **from** it to the remote; remote changes are fetched **into**
+it. The `.git` store is hidden and never projected, and the write-back watcher ignores it (so
+bosync's own commits don't trigger more commits).
 
 While mounted, each entry carries one of three **sync states**, shown as an overlay in the file
 manager:
 
 | State | Meaning | Shown when |
 |---|---|---|
-| **remote** | Cloud-only placeholder, no local bytes | Every entry right after mount |
-| **local** | Present locally, committed but **not yet pushed** | You create/edit a file |
-| **synced** | Committed **and** pushed — confirmed identical to the remote | A push succeeds |
+| **remote** | Lives on the remote only | (future: on-demand/online-only entries) |
+| **local** | Committed locally but **not yet pushed** | A save whose push hasn't landed |
+| **synced** | Committed **and** pushed — identical to the remote | After a successful push |
 
-The transitions follow the mount lifecycle:
+A file becomes **synced only once it has been committed *and* pushed**, so the overlay never
+claims "in sync" for work that's still only on this machine. Push works in pure Rust for a
+**local target** (`file://` / a path): bosync copies the new objects into the target, fast-
+forwards its branch, and updates its working copy (renames/deletes included, no stale files). A
+**network** remote (ssh/https) can't be pushed yet — gix 0.84 has no pack send — so those files
+honestly stay `local` and bosync retries on the next save.
 
-```
-                 create / edit            push succeeds
-   remote  ───────────────────▶  local  ───────────────▶  synced
-     ▲         (commit)                                       │
-     └───────────────────────────────────────────────────────┘
-       background fetch --depth=1 brings a remote change
-              (re-dehydrate the changed entries)
-```
+The model lives in `bosync-core` (`ProxyState`, `Proxy::on_save`, `Proxy::refresh_branch`) and is
+platform-agnostic; each platform's `CloudSync::mark_state` maps it to the OS overlay. Background
+refresh runs the gitoxide equivalent of `git fetch --depth=1 origin <branch>` in place,
+fast-forwards `HEAD`, and writes the changed files into the folder — no re-clone.
 
-A file becomes **synced only once it has been committed *and* pushed** — until the push lands
-it stays **local**, so the overlay never claims "in sync" for work that's still only on this
-machine. Push works in pure Rust for a **local target** (`file://` / a path): bosync copies the
-new objects into the target and fast-forwards its branch (and working copy). A **network**
-remote (ssh/https) can't be pushed yet — gix 0.84 has no pack send — so those files honestly
-stay `local` and bosync retries on the next save.
+## Pacing the remote
 
-The state model lives in `bosync-core` (`ProxyState`, `Proxy::on_save`, `Proxy::refresh_branch`)
-and is platform-agnostic; each platform's `CloudSync::mark_state` maps it to the OS overlay. The
-background refresh runs the gitoxide equivalent of `git fetch --depth=1 origin <branch>` in
-place and fast-forwards `HEAD`, so the running mount serves new content without a re-clone.
+A live mount commits on every save, but it must not push on every commit or fetch on a tight
+loop — against a hosted remote (GitHub, …) that's wasteful and a fast route to a rate-limit ban.
+`bosync-core::SyncScheduler` turns the raw "a change happened" stream into paced traffic, and the
+mount loop drives it (`bosync-cli`):
+
+- **Pushes are batched.** The first unpushed change arms a short timer (`push_base`, 8s). Each
+  further change while the batch is pending extends the deadline by a *geometrically shrinking*
+  amount (`push_base · push_decay^n`). Those extensions form a convergent series, so a steady
+  edit stream is still force-pushed by a hard ceiling of `push_base / (1 − push_decay)` (≈ 20s)
+  after the first change — you're never stuck unpushed, but a burst of N saves costs **one** push,
+  not N. (Verified: 4 files created over ~2.4s → a single batched push of 4 commits.)
+- **Fetches yield, back off, and jitter.** While anything is waiting to be pushed, no fetch runs
+  — we finish our push first. When idle, fetches run on an interval (`fetch_base`, 60s) that
+  grows geometrically while the remote is quiet (up to `fetch_max`, 5 min) and snaps back the
+  moment something changes, each one ±25% jittered so many clients don't stampede the host in
+  lockstep. A failed push (e.g. a network remote with no pack send) retries after a backoff
+  rather than hammering.
+
+The scheduler is pure and deterministic — jitter is a seeded xorshift PRNG — so the whole policy
+is unit-tested against a synthetic clock with no real time, network, or randomness. A
+committed-but-unpushed entry shows the **syncing** overlay until the batched push promotes the
+tree to **synced**.
 
 ## Sync interview (`bosync sync`)  — the primary interface
 

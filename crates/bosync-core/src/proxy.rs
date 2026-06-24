@@ -117,11 +117,25 @@ impl Proxy {
     pub fn refresh_branch(&mut self, branch: &str) -> Result<Vec<String>> {
         let before = self.git.walk("HEAD").unwrap_or_default();
         if !self.git.fetch_shallow(&self.remote, branch, self.depth)? {
-            return Ok(Vec::new()); // remote hasn't moved; nothing to re-dehydrate
+            return Ok(Vec::new()); // remote hasn't moved; nothing to pull down
         }
         let after = self.git.walk("HEAD").unwrap_or_default();
         self.git.prune()?; // best-effort compaction (gix has no gc yet)
-        Ok(changed_paths(&before, &after))
+
+        // The proxy folder *is* the working copy the user browses, so write the new content of
+        // each changed entry into it. (Content equals the freshly fetched `HEAD`, so the
+        // write-back watcher sees no diff and produces no spurious commit.)
+        let changed = changed_paths(&before, &after);
+        for rel in &changed {
+            if let Ok(content) = self.git.read_blob(rel) {
+                let full = join_rel(&self.root, rel);
+                if let Some(parent) = full.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&full, content);
+            }
+        }
+        Ok(changed)
     }
 
     /// On save of `abs`: reconcile the local change into a commit, then push it to the remote,
@@ -202,6 +216,16 @@ impl Proxy {
 /// derive a default drive folder name when the user doesn't pass one.
 pub fn repo_name(remote: &str) -> String {
     owner_repo(remote).1
+}
+
+/// Join a `/`-separated repo-relative path onto a base directory, component by component, so it
+/// is correct regardless of the platform path separator.
+fn join_rel(base: &Path, rel: &str) -> PathBuf {
+    let mut full = base.to_path_buf();
+    for part in rel.split('/') {
+        full.push(part);
+    }
+    full
 }
 
 /// The relative paths that changed between two `walk()` snapshots (`(path, oid, size)`): a path

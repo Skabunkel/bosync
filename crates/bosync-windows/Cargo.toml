@@ -13,3 +13,5 @@ tracing.workspace = true
 # Cloud Filter is Windows-only; depend on it only there so the workspace builds on every OS.
 [target.'cfg(windows)'.dependencies]
 cloud-filter.workspace = true
+# Pure-Rust WinAPI bindings — used only to set the hidden attribute on the proxy's `.git`.
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }

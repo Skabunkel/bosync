@@ -14,4 +14,4 @@
 mod windows;
 
 #[cfg(windows)]
-pub use windows::{mark_tree_in_sync, BosyncFilter, SyncRoot, WindowsCloudSync};
+pub use windows::{hide_dir, mark_tree_in_sync, BosyncFilter, SyncRoot, WindowsCloudSync};

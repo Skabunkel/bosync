@@ -434,6 +434,13 @@ impl GitBackend {
             return Ok(());
         }
 
+        // Capture the target's old file set (so we know what to delete from its working copy
+        // after the update — e.g. the old name of a rename).
+        let old_paths = match target_tip {
+            Some(id) => commit_tree_paths(&target, id)?,
+            None => Default::default(),
+        };
+
         // Copy the objects the target is missing (the new commit, its new trees and blobs). The
         // walk stops as soon as it meets an object the target already has — and since the proxy
         // is a shallow clone of this target, the unchanged history/subtrees are all already there.
@@ -444,10 +451,14 @@ impl GitBackend {
             .reference(branch.as_bstr(), head_id, PreviousValue::Any, "bosync: push")
             .context("updating target branch ref")?;
 
-        // Mirror the new tree into the target's working copy + index (skip a bare repo).
+        // Mirror the new tree into the target's working copy + index (skip a bare repo): write
+        // the new content and delete files that no longer exist in the tree, so a rename leaves
+        // no stale file behind and `git status` stays clean.
         if target.workdir().is_some() {
             let tree_id = target.find_object(head_id)?.try_into_commit()?.tree_id()?.detach();
-            materialize_worktree(&target, &tree_id)?;
+            let new_paths = commit_tree_paths(&target, head_id)?;
+            let removed: Vec<&String> = old_paths.difference(&new_paths).collect();
+            sync_worktree(&target, &tree_id, &removed)?;
         }
 
         tracing::info!(%url, commit = %head_id, target = ?target_path, "pushed to local target");
@@ -612,14 +623,31 @@ fn copy_missing_objects(
     Ok(())
 }
 
-/// Write every blob of `tree_id` into `repo`'s working directory and reset its index to match,
-/// so the working copy and `git status` reflect the tree (used after a local push).
-fn materialize_worktree(repo: &gix::Repository, tree_id: &gix::ObjectId) -> Result<()> {
+/// The set of `/`-separated file paths in the tree of `commit_id`.
+fn commit_tree_paths(
+    repo: &gix::Repository,
+    commit_id: gix::ObjectId,
+) -> Result<std::collections::HashSet<String>> {
+    let tree = repo.find_object(commit_id)?.try_into_commit()?.tree()?;
+    let mut out = Vec::new();
+    walk_tree(repo, &tree, "", &mut out)?;
+    Ok(out.into_iter().map(|(path, _, _)| path).collect())
+}
+
+/// Make `repo`'s working directory match `tree_id`: write every blob, delete `removed` paths
+/// (and their now-empty parents), and reset the index — so the working copy and `git status`
+/// reflect the tree exactly (used after a local push, including renames/deletes).
+fn sync_worktree(repo: &gix::Repository, tree_id: &gix::ObjectId, removed: &[&String]) -> Result<()> {
     let Some(wd) = repo.workdir().map(|p| p.to_owned()) else {
         return Ok(());
     };
     if let Ok(mut index) = repo.index_from_tree(tree_id) {
         let _ = index.write(gix::index::write::Options::default());
+    }
+    for rel in removed {
+        let full = join_rel(&wd, rel);
+        let _ = std::fs::remove_file(&full);
+        prune_empty_dirs(&wd, full.parent());
     }
     let tree = repo.find_object(*tree_id)?.try_into_tree()?;
     let mut blobs = Vec::new();
@@ -761,6 +789,15 @@ mod tests {
 
         // Pushing again is a clean no-op (already up to date).
         proxy.push(&url).unwrap();
+
+        // A rename pushed to the target must leave no stale file in its working copy.
+        proxy.rename_in_git("pushed.txt", "moved.txt").unwrap();
+        proxy.push(&url).unwrap();
+        assert!(target_dir.join("moved.txt").exists(), "new name present");
+        assert!(!target_dir.join("pushed.txt").exists(), "old name removed");
+        let target2 = GitBackend::open(&target_dir).unwrap();
+        assert!(target2.read_blob("pushed.txt").is_err(), "old name gone from git");
+        assert_eq!(target2.read_blob("moved.txt").unwrap(), b"hi from proxy\n");
 
         let _ = std::fs::remove_dir_all(&target_dir);
         let _ = std::fs::remove_dir_all(proxy_dir.parent().unwrap());
