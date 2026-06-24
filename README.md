@@ -138,7 +138,10 @@ The transitions follow the mount lifecycle:
 
 A file becomes **synced only once it has been committed *and* pushed** — until the push lands
 it stays **local**, so the overlay never claims "in sync" for work that's still only on this
-machine. (Pure-Rust push is still pending in `gix`; until then files honestly remain `local`.)
+machine. Push works in pure Rust for a **local target** (`file://` / a path): bosync copies the
+new objects into the target and fast-forwards its branch (and working copy). A **network**
+remote (ssh/https) can't be pushed yet — gix 0.84 has no pack send — so those files honestly
+stay `local` and bosync retries on the next save.
 
 The state model lives in `bosync-core` (`ProxyState`, `Proxy::on_save`, `Proxy::refresh_branch`)
 and is platform-agnostic; each platform's `CloudSync::mark_state` maps it to the OS overlay. The

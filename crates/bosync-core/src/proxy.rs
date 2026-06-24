@@ -59,6 +59,9 @@ impl Proxy {
     /// As [`Self::open_or_clone`] but with an explicit proxy folder and depth (used by tests
     /// and by callers that want to control placement).
     pub fn open_or_clone_in(remote: &str, root: &Path, depth: u32) -> Result<Self> {
+        // Normalize local `file://C:\…` remotes to a plain path — gix mishandles those URLs on
+        // Windows. Stored as `self.remote` so clone, fetch and push all use the clean form.
+        let remote: &str = &bosync_git::normalize_remote(remote);
         let git = if root.join(".git").exists() {
             tracing::info!(?root, "reusing existing proxy");
             GitBackend::open(root)?

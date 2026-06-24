@@ -220,13 +220,23 @@ fn mount(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     for path in pending.drain() {
                         match reconcile_path(&git, &cloud, &drive, &path) {
-                            // Committed locally. Pure-Rust push isn't in gix yet, so the change
-                            // stays on this machine — the file is Local (pending), not Synced.
-                            // Once push lands, this is where it would promote to Synced.
+                            // Committed to the proxy → Local. Then push it to the remote; if that
+                            // lands (always, for a local target), promote to Synced so the
+                            // "syncing" overlay clears. A failed push (network remote) leaves it
+                            // Local and we retry next time.
                             Ok(Reconciled::Committed) => {
                                 cloud.mark_state(&drive, &path, ProxyState::Local);
+                                match git.push(&remote) {
+                                    Ok(()) => cloud.mark_state(&drive, &path, ProxyState::Synced),
+                                    Err(e) => tracing::warn!(?path, "push failed (stays local): {e:#}"),
+                                }
                             }
-                            Ok(_) => {}
+                            Ok(Reconciled::Removed) => {
+                                if let Err(e) = git.push(&remote) {
+                                    tracing::warn!(?path, "push of removal failed: {e:#}");
+                                }
+                            }
+                            Ok(Reconciled::Unchanged) => {}
                             Err(e) => tracing::warn!(?path, "reconcile failed: {e:#}"),
                         }
                     }

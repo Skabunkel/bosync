@@ -10,10 +10,10 @@
 //! be shared across the Cloud Filter callback threads.
 
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use gix::object::tree::EntryKind;
 
 /// A list of blobs as `(path_relative_to_some_root, content)` pairs.
@@ -395,14 +395,63 @@ impl GitBackend {
         Ok(moved)
     }
 
-    /// Push committed changes back to `url`.
+    /// Push the proxy's `HEAD` back to `url`.
     ///
-    /// NOTE: gix 0.84 does not yet implement sending packs, so there is no pure-Rust push.
-    /// This is the single seam to wire up once gix gains push support (see the "Remote auth"
-    /// risk in PLAN.html). Until then it returns an error; [`crate`] callers keep the commit
-    /// locally and retry, so no data is lost.
+    /// gix 0.84 can't send packs over the network, so a *network* push (ssh/https) still isn't
+    /// possible — that call errors and the caller keeps the commit locally. But a **local**
+    /// target (`file://` or a filesystem path — which is exactly what a same-machine remote is)
+    /// can be pushed in pure Rust: we copy the new object closure into the target's object store
+    /// and fast-forward its branch, then mirror the tree into its working copy so `git log` and
+    /// the folder both show the change.
     pub fn push(&self, url: &str) -> Result<()> {
-        anyhow::bail!("git push is not yet supported by gix 0.84 (commit for {url} kept locally)")
+        use gix::refs::transaction::PreviousValue;
+
+        let Some(target_path) = local_remote_path(url) else {
+            bail!("push to non-local remote {url} not supported (gix 0.84 has no pack send)");
+        };
+
+        let proxy = self.repo.to_thread_local();
+        let head_id = match proxy.head_commit() {
+            Ok(c) => c.id().detach(),
+            Err(_) => return Ok(()), // nothing committed yet
+        };
+        let branch = proxy
+            .head_name()
+            .ok()
+            .flatten()
+            .ok_or_else(|| anyhow!("proxy HEAD is detached; cannot push"))?;
+
+        let target = gix::open(&target_path)
+            .with_context(|| format!("opening local target repo at {target_path:?}"))?;
+
+        // Already at our commit? Nothing to do.
+        let target_tip = target
+            .try_find_reference(branch.as_bstr())
+            .ok()
+            .flatten()
+            .and_then(|r| r.try_id().map(|id| id.detach()));
+        if target_tip == Some(head_id) {
+            return Ok(());
+        }
+
+        // Copy the objects the target is missing (the new commit, its new trees and blobs). The
+        // walk stops as soon as it meets an object the target already has — and since the proxy
+        // is a shallow clone of this target, the unchanged history/subtrees are all already there.
+        copy_missing_objects(&proxy, &target, head_id)?;
+
+        // Fast-forward the target's branch to the pushed commit.
+        target
+            .reference(branch.as_bstr(), head_id, PreviousValue::Any, "bosync: push")
+            .context("updating target branch ref")?;
+
+        // Mirror the new tree into the target's working copy + index (skip a bare repo).
+        if target.workdir().is_some() {
+            let tree_id = target.find_object(head_id)?.try_into_commit()?.tree_id()?.detach();
+            materialize_worktree(&target, &tree_id)?;
+        }
+
+        tracing::info!(%url, commit = %head_id, target = ?target_path, "pushed to local target");
+        Ok(())
     }
 
     /// Prune to keep the proxy's git size down (idle maintenance).
@@ -469,6 +518,120 @@ impl GitBackend {
         walk_tree(&repo, &tree, "", &mut out)?;
         Ok(out)
     }
+}
+
+/// Normalize a remote URL for gix on every platform. A **local** remote (`file://…` or a bare
+/// path) becomes a plain forward-slash path — gix's clone/fetch mishandle `file://C:\…` URLs on
+/// Windows, but a plain path works. A **network** remote is returned untouched.
+pub fn normalize_remote(url: &str) -> String {
+    match local_remote_path(url) {
+        Some(p) => p.to_string_lossy().replace('\\', "/"),
+        None => url.trim().to_string(),
+    }
+}
+
+/// Resolve a remote `url` to a local filesystem path if it is one (`file://…` or a bare path),
+/// or `None` for a network remote (`ssh://`, `http(s)://`, `git@host:owner/repo`) which gix
+/// can't push to.
+fn local_remote_path(url: &str) -> Option<PathBuf> {
+    let u = url.trim();
+    if let Some(rest) = u.strip_prefix("file://") {
+        // `file:///C:/x` → `/C:/x` → `C:/x`; `file://C:\x` → `C:\x`; `file:///home/x` → `/home/x`.
+        let rest = match rest.strip_prefix('/') {
+            Some(after) if is_windows_drive(after) => after,
+            _ => rest,
+        };
+        return Some(PathBuf::from(rest));
+    }
+    // Any explicit scheme, or an scp-like `host:path`, is a network remote.
+    if u.contains("://") || is_scp_like(u) {
+        return None;
+    }
+    Some(PathBuf::from(u))
+}
+
+/// Whether `s` begins with a Windows drive spec like `C:` (so a leading `/` from a `file:///`
+/// URL should be dropped).
+fn is_windows_drive(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// Whether `s` is an scp-like remote (`git@host:owner/repo`, `host.tld:path`) rather than a
+/// local path. A Windows `C:\path` is *not* scp-like (single-letter host, no `@`/`.`).
+fn is_scp_like(s: &str) -> bool {
+    if s.contains("://") {
+        return false;
+    }
+    match s.split_once(':') {
+        Some((before, _)) => before.contains('@') || (before.len() > 1 && before.contains('.')),
+        None => false,
+    }
+}
+
+/// Copy every object reachable from `start` that `dst` is missing, from `src` into `dst`,
+/// preserving object ids (content-addressed: writing the same bytes reproduces the same oid).
+/// Stops descending as soon as an object is already present in `dst`.
+fn copy_missing_objects(
+    src: &gix::Repository,
+    dst: &gix::Repository,
+    start: gix::ObjectId,
+) -> Result<()> {
+    use gix::objs::{CommitRef, Kind, TreeRef};
+    use gix::prelude::Write;
+
+    let hash = src.object_hash();
+    let mut stack = vec![start];
+    while let Some(id) = stack.pop() {
+        if dst.has_object(id) {
+            continue;
+        }
+        let obj = src
+            .find_object(id)
+            .with_context(|| format!("reading object {id} to copy"))?;
+        let kind = obj.kind;
+        let data = obj.data.clone();
+        match kind {
+            Kind::Commit => {
+                let commit = CommitRef::from_bytes(&data, hash)?;
+                stack.push(commit.tree());
+                stack.extend(commit.parents());
+            }
+            Kind::Tree => {
+                let tree = TreeRef::from_bytes(&data, hash)
+                    .map_err(|e| anyhow!("decoding tree {id}: {e}"))?;
+                for entry in &tree.entries {
+                    stack.push(entry.oid.to_owned());
+                }
+            }
+            Kind::Blob | Kind::Tag => {}
+        }
+        dst.write_buf(kind, &data)
+            .map_err(|e| anyhow!("writing object {id} into target: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Write every blob of `tree_id` into `repo`'s working directory and reset its index to match,
+/// so the working copy and `git status` reflect the tree (used after a local push).
+fn materialize_worktree(repo: &gix::Repository, tree_id: &gix::ObjectId) -> Result<()> {
+    let Some(wd) = repo.workdir().map(|p| p.to_owned()) else {
+        return Ok(());
+    };
+    if let Ok(mut index) = repo.index_from_tree(tree_id) {
+        let _ = index.write(gix::index::write::Options::default());
+    }
+    let tree = repo.find_object(*tree_id)?.try_into_tree()?;
+    let mut blobs = Vec::new();
+    collect_tree_blobs(repo, &tree, "", &mut blobs)?;
+    for (rel, content) in blobs {
+        let full = join_rel(&wd, &rel);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&full, content)?;
+    }
+    Ok(())
 }
 
 /// Remove empty directories from `dir` upward, stopping at `base` or the first non-empty
@@ -543,4 +706,71 @@ fn walk_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A unique temp directory (no external crate, to keep deps light).
+    fn tmp(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("bosync-git-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn local_remote_path_classifies_urls() {
+        // Network remotes → not pushable locally.
+        assert!(local_remote_path("ssh://git@host/o/r").is_none());
+        assert!(local_remote_path("https://github.com/o/r.git").is_none());
+        assert!(local_remote_path("git@github.com:o/r.git").is_none());
+        // Local forms → a path.
+        assert_eq!(local_remote_path("file:///C:/x").unwrap(), PathBuf::from("C:/x"));
+        assert_eq!(local_remote_path(r"file://C:\x").unwrap(), PathBuf::from(r"C:\x"));
+        assert_eq!(local_remote_path(r"C:\repo").unwrap(), PathBuf::from(r"C:\repo"));
+        assert_eq!(
+            local_remote_path("/home/me/repo").unwrap(),
+            PathBuf::from("/home/me/repo")
+        );
+    }
+
+    #[test]
+    fn push_to_local_target_publishes_commit_and_worktree() {
+        // A target repo with a working tree stands in for a same-machine remote.
+        let target_dir = tmp("target");
+        GitBackend::init_sample(&target_dir).unwrap();
+        let url = target_dir.to_string_lossy().replace('\\', "/");
+
+        // Shallow-clone it into a proxy, commit a new file there, and push it back.
+        let proxy_dir = tmp("proxy").join("p");
+        let proxy = GitBackend::clone_shallow(&url, &proxy_dir, 1).unwrap();
+        proxy
+            .commit_upsert("pushed.txt", b"hi from proxy\n", "Add pushed.txt")
+            .unwrap();
+        proxy.push(&url).unwrap();
+
+        // The target has the object, its branch advanced, and the file is in its working tree.
+        let target = GitBackend::open(&target_dir).unwrap();
+        assert_eq!(target.read_blob("pushed.txt").unwrap(), b"hi from proxy\n");
+        assert!(target_dir.join("pushed.txt").exists());
+        assert_eq!(proxy.rev_id("HEAD"), target.rev_id("HEAD"));
+
+        // Pushing again is a clean no-op (already up to date).
+        proxy.push(&url).unwrap();
+
+        let _ = std::fs::remove_dir_all(&target_dir);
+        let _ = std::fs::remove_dir_all(proxy_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn push_to_nonlocal_remote_errors() {
+        let dir = tmp("nonlocal");
+        let git = GitBackend::init_sample(&dir).unwrap();
+        assert!(git.push("ssh://git@host/o/r").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
