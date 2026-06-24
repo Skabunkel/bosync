@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use bosync_git::GitBackend;
 
-use crate::mount::CloudSync;
-use crate::reconcile::reconcile_path;
+use crate::mount::{CloudSync, ProxyState};
+use crate::reconcile::{reconcile_path, Reconciled};
 
 /// Default shallow-clone depth. One commit is enough to project the current tree; history is
 /// pruned anyway, so we keep the proxy as small as possible.
@@ -98,14 +98,60 @@ impl Proxy {
         Ok(())
     }
 
-    /// On save of `abs`: reconcile the local change into a commit, then push it to the remote.
+    /// Bring the proxy up to date with `branch` and report which entries changed — the plan's
+    /// "convert back to a shallow copy" step, run *in place* so it is safe while the drive is
+    /// mounted.
     ///
-    /// Push is best-effort and reported separately from the commit so that a network failure
-    /// doesn't lose the local commit — the next [`Self::refresh`]/save can retry the push.
+    /// `git fetch --depth=1 origin <branch>` (via [`GitBackend::fetch_shallow`]) pulls the
+    /// latest objects, stays shallow, and fast-forwards `HEAD` to the fetched tip. Because the
+    /// live projection reads `HEAD` afresh on each callback, the new tree shows up immediately
+    /// without re-acquiring the git handle.
+    ///
+    /// Returns the `/`-separated repo-relative paths whose blob changed or appeared (an empty
+    /// vec if the remote hadn't moved). The platform layer maps these onto the drive and marks
+    /// them [`Remote`](crate::ProxyState::Remote) so they re-dehydrate to cloud-only
+    /// placeholders, keeping the proxy small.
+    pub fn refresh_branch(&mut self, branch: &str) -> Result<Vec<String>> {
+        let before = self.git.walk("HEAD").unwrap_or_default();
+        if !self.git.fetch_shallow(&self.remote, branch, self.depth)? {
+            return Ok(Vec::new()); // remote hasn't moved; nothing to re-dehydrate
+        }
+        let after = self.git.walk("HEAD").unwrap_or_default();
+        self.git.prune()?; // best-effort compaction (gix has no gc yet)
+        Ok(changed_paths(&before, &after))
+    }
+
+    /// On save of `abs`: reconcile the local change into a commit, then push it to the remote,
+    /// driving the [`ProxyState`] overlay as it goes.
+    ///
+    /// The state transitions follow the plan exactly: a committed file is first marked
+    /// [`Local`](ProxyState::Local) (present, but not yet confirmed on the remote), and only
+    /// promoted to [`Synced`](ProxyState::Synced) once the push succeeds. If the push fails
+    /// (or isn't supported yet), the commit is kept locally and the file stays `Local`, so the
+    /// next save/refresh can retry the push without losing work — and the overlay honestly
+    /// reflects "committed but not pushed".
     pub fn on_save<C: CloudSync>(&self, cloud: &C, abs: &Path) -> Result<()> {
-        reconcile_path(&self.git, cloud, &self.root, abs)?;
-        if let Err(e) = self.git.push(&self.remote) {
-            tracing::warn!(remote = %self.remote, "push failed (commit kept locally): {e:#}");
+        match reconcile_path(&self.git, cloud, &self.root, abs)? {
+            Reconciled::Committed => {
+                // Committed, push pending → Local.
+                cloud.mark_state(&self.root, abs, ProxyState::Local);
+                match self.git.push(&self.remote) {
+                    // Pushed → confirmed identical to the remote.
+                    Ok(()) => cloud.mark_state(&self.root, abs, ProxyState::Synced),
+                    Err(e) => tracing::warn!(
+                        remote = %self.remote,
+                        "push failed (commit kept locally, file stays Local): {e:#}"
+                    ),
+                }
+            }
+            Reconciled::Removed => {
+                // The removal is committed; push it so the remote drops the file too. Nothing
+                // remains on disk to carry an overlay.
+                if let Err(e) = self.git.push(&self.remote) {
+                    tracing::warn!(remote = %self.remote, "push of removal failed (kept locally): {e:#}");
+                }
+            }
+            Reconciled::Unchanged => {}
         }
         Ok(())
     }
@@ -147,6 +193,31 @@ impl Proxy {
             }
         }
     }
+}
+
+/// The repository name parsed from a remote URL — the last path segment, sans `.git`. Used to
+/// derive a default drive folder name when the user doesn't pass one.
+pub fn repo_name(remote: &str) -> String {
+    owner_repo(remote).1
+}
+
+/// The relative paths that changed between two `walk()` snapshots (`(path, oid, size)`): a path
+/// is "changed" if its blob oid differs, or it is present in `after` but not `before`. Removed
+/// paths are not returned — there is no on-disk entry left to re-dehydrate.
+fn changed_paths(
+    before: &[(String, String, u64)],
+    after: &[(String, String, u64)],
+) -> Vec<String> {
+    use std::collections::HashMap;
+    let prior: HashMap<&str, &str> = before
+        .iter()
+        .map(|(p, oid, _)| (p.as_str(), oid.as_str()))
+        .collect();
+    after
+        .iter()
+        .filter(|(path, oid, _)| prior.get(path.as_str()) != Some(&oid.as_str()))
+        .map(|(path, _, _)| path.clone())
+        .collect()
 }
 
 /// Parse the `(creator, repo)` pair out of a git remote URL, for the `bosync/<creator>/<repo>`
@@ -238,6 +309,83 @@ mod tests {
         assert_eq!(a1, a2, "same remote -> same proxy dir");
         assert_ne!(a1, b, "different repo -> different proxy dir");
         assert_eq!(a1.parent(), b.parent(), "same creator -> shared parent dir");
+    }
+
+    #[test]
+    fn changed_paths_reports_modified_and_new_only() {
+        let before = vec![
+            ("a.txt".to_string(), "oid_a".to_string(), 1),
+            ("b.txt".to_string(), "oid_b".to_string(), 1),
+            ("gone.txt".to_string(), "oid_g".to_string(), 1),
+        ];
+        let after = vec![
+            ("a.txt".to_string(), "oid_a".to_string(), 1), // unchanged
+            ("b.txt".to_string(), "oid_b2".to_string(), 1), // modified
+            ("new.txt".to_string(), "oid_n".to_string(), 1), // added
+        ];
+        let mut changed = changed_paths(&before, &after);
+        changed.sort();
+        assert_eq!(changed, vec!["b.txt".to_string(), "new.txt".to_string()]);
+    }
+
+    #[test]
+    fn on_save_keeps_file_local_when_push_is_unavailable() {
+        use crate::testutil::RecordingCloudSync;
+        use crate::ProxyState;
+
+        // Stand in a local repo for the remote so open_or_clone reuses it (no network).
+        let dir = TmpDir::new();
+        GitBackend::init_sample(dir.path()).unwrap();
+        let proxy = Proxy::open_or_clone_in("file://unused", dir.path(), DEFAULT_DEPTH).unwrap();
+
+        let cloud = RecordingCloudSync::default();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"edited locally\n").unwrap();
+
+        proxy.on_save(&cloud, &file).unwrap();
+
+        // Committed, but push isn't supported yet → the file is Local, never promoted to Synced.
+        assert_eq!(cloud.state_of(&file), Some(ProxyState::Local));
+        assert_eq!(proxy.git().read_blob("hello.txt").unwrap(), b"edited locally\n");
+    }
+
+    #[test]
+    fn refresh_branch_detects_remote_changes_and_stays_shallow() {
+        // A local sample repo stands in for the remote (forward slashes: gix's local transport
+        // wants a URL-ish path, not a backslashed Windows path).
+        let remote_dir = TmpDir::new();
+        GitBackend::init_sample(remote_dir.path()).unwrap();
+        let remote_url = remote_dir.path().to_string_lossy().replace('\\', "/");
+
+        // The proxy: a shallow clone of that "remote".
+        let proxy_parent = TmpDir::new();
+        let proxy_root = proxy_parent.path().join("proxy");
+        let mut proxy =
+            Proxy::open_or_clone_in(&remote_url, &proxy_root, DEFAULT_DEPTH).unwrap();
+
+        // Nothing has changed yet.
+        assert!(proxy.refresh_branch("master").unwrap().is_empty());
+
+        // Advance the remote: edit one file, add another.
+        let remote_git = GitBackend::open(remote_dir.path()).unwrap();
+        remote_git
+            .commit_upsert("hello.txt", b"CHANGED\n", "edit hello")
+            .unwrap();
+        remote_git
+            .commit_upsert("newfile.txt", b"brand new\n", "add newfile")
+            .unwrap();
+
+        // Refresh reports exactly the changed/new paths...
+        let mut changed = proxy.refresh_branch("master").unwrap();
+        changed.sort();
+        assert_eq!(changed, vec!["hello.txt".to_string(), "newfile.txt".to_string()]);
+
+        // ...HEAD fast-forwarded so the projection now serves the new content...
+        assert_eq!(proxy.git().read_blob("hello.txt").unwrap(), b"CHANGED\n");
+        assert_eq!(proxy.git().read_blob("newfile.txt").unwrap(), b"brand new\n");
+
+        // ...and the proxy is still a shallow copy.
+        assert!(proxy.root().join(".git").join("shallow").exists());
     }
 
     #[test]

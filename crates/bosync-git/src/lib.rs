@@ -315,6 +315,86 @@ impl GitBackend {
         Self::clone_shallow(url, dest, depth)
     }
 
+    /// Fetch the latest of `branch` from `url` at `depth`, staying shallow, and fast-forward the
+    /// checked-out branch to it — the gitoxide equivalent of `git fetch --depth=1 origin <branch>`
+    /// followed by advancing the local branch to the fetched tip.
+    ///
+    /// The update is done **in place** (it never wipes the proxy): it adds the new objects, moves
+    /// the `refs/remotes/origin/<branch>` tracking ref, then re-points `HEAD`'s branch at the new
+    /// commit. A live mount reads `HEAD` afresh on every callback, so it immediately projects the
+    /// new tree without re-acquiring the git handle — which is what makes background refresh safe
+    /// while the drive is mounted. Returns `true` if `HEAD` moved.
+    ///
+    /// `with_shallow(DepthAtRemote)` keeps the history clamped to `depth` so the fetch never
+    /// deepens the proxy. (There is no pure-Rust `gc`/`reflog expire` in gix yet, so loose
+    /// objects from previous fetches are not reclaimed — a known size trade-off, see
+    /// [`Self::prune`].)
+    pub fn fetch_shallow(&self, url: &str, branch: &str, depth: u32) -> Result<bool> {
+        use gix::refs::transaction::PreviousValue;
+        use gix::remote::{fetch::Shallow, Direction};
+
+        let depth = NonZeroU32::new(depth.max(1)).expect("depth >= 1");
+        let should_interrupt = AtomicBool::new(false);
+        let repo = self.repo.to_thread_local();
+
+        let track = format!("refs/remotes/origin/{branch}");
+        let tracked_oid = |repo: &gix::Repository| -> Option<gix::ObjectId> {
+            repo.try_find_reference(track.as_str())
+                .ok()
+                .flatten()
+                .and_then(|r| r.try_id().map(|id| id.detach()))
+        };
+        // Compare the *remote* tracking ref, not local HEAD: a local (un-pushed) commit moves
+        // HEAD but not the remote, and must not count as the remote having advanced.
+        let remote_before = tracked_oid(&repo);
+
+        // `+refs/heads/<branch>:refs/remotes/origin/<branch>` — fetch just the one branch and
+        // force-update its tracking ref, exactly like `git fetch origin <branch>`.
+        let refspec = format!("+refs/heads/{branch}:{track}");
+        // Prefer the `origin` remote configured at clone time: gix stored and parsed its URL
+        // itself, so it round-trips correctly (a hand-built `file://C:/…` URL does not). Fall
+        // back to the caller's URL for proxies without an `origin`.
+        let remote = match repo.find_remote("origin") {
+            Ok(remote) => remote,
+            Err(_) => repo
+                .remote_at(url)
+                .with_context(|| format!("addressing remote {url}"))?,
+        };
+        let remote = remote
+            .with_refspecs(Some(refspec.as_bytes()), Direction::Fetch)
+            .context("setting fetch refspec")?;
+
+        remote
+            .connect(Direction::Fetch)
+            .with_context(|| format!("connecting to {url}"))?
+            .prepare_fetch(gix::progress::Discard, Default::default())
+            .context("preparing fetch")?
+            .with_shallow(Shallow::DepthAtRemote(depth))
+            .receive(gix::progress::Discard, &should_interrupt)
+            .with_context(|| format!("fetching {branch} from {url}"))?;
+
+        let remote_after = tracked_oid(&repo);
+        let moved = remote_before != remote_after;
+
+        // Only when the remote genuinely advanced: fast-forward the checked-out branch to it, so
+        // the projection (which reads `HEAD`) reflects the change. Without push there is nothing
+        // to lose by force-moving it — a moved remote means someone else advanced the branch.
+        if moved {
+            if let (Some(tip), Ok(Some(branch_ref))) = (remote_after, repo.head_name()) {
+                repo.reference(
+                    branch_ref.as_bstr(),
+                    tip,
+                    PreviousValue::Any,
+                    "bosync: fast-forward to fetched tip",
+                )
+                .context("fast-forwarding HEAD to fetched tip")?;
+            }
+        }
+
+        tracing::info!(%url, %branch, moved, "shallow fetch complete");
+        Ok(moved)
+    }
+
     /// Push committed changes back to `url`.
     ///
     /// NOTE: gix 0.84 does not yet implement sending packs, so there is no pure-Rust push.

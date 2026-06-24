@@ -28,19 +28,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Mount a git repository as a virtual drive at <drive>. (Windows only for now.)
+    /// Mount a remote as a live virtual drive. (Windows; Linux mounts read-only.)
+    ///
+    /// bosync shallow-clones the remote into an internal per-user proxy and projects it as a
+    /// virtual drive: entries appear as cloud-only "remote" placeholders, hydrate on open, and
+    /// commit back on save. In the background it keeps fetching `--depth=1` and re-dehydrates
+    /// anything the remote changed — so the folder stays a thin, always-current mirror.
     Mount {
-        /// Path to the backing git repository (the on-disk proxy).
+        /// Remote URL to mount: `ssh://`, `git@host:owner/repo`, or `http(s)://`.
         #[arg(long)]
-        repo: PathBuf,
-        /// Empty folder to expose as the drive (the sync root).
-        #[arg(long)]
-        drive: PathBuf,
+        remote: String,
+        /// Folder to expose as the live drive (created if missing). Defaults to
+        /// `<cwd>/<repo-name>`.
+        #[arg(long, alias = "drive")]
+        into: Option<PathBuf>,
+        /// Branch to track for background refresh.
+        #[arg(long, default_value = "master")]
+        branch: String,
+        /// Shallow-clone depth — the smaller the better. Defaults to 1 (just the current tree).
+        #[arg(long, default_value_t = bosync_core::DEFAULT_DEPTH)]
+        depth: u32,
         /// Mount read-only: serve files for reading but never commit local changes back.
         #[arg(long)]
         readonly: bool,
     },
-    /// Create a sample git repository to mount.
+    /// Create a sample git repository to use as a fake remote.
     Sample {
         /// Where to create the sample repo.
         #[arg(long)]
@@ -67,33 +79,86 @@ fn main() -> Result<()> {
                 .with_context(|| format!("creating sample repo at {repo:?}"))?;
             println!("Created sample repo at {}", repo.display());
             println!(
-                "Now run:  bosync mount --repo {} --drive <empty-folder>",
+                "Now run:  bosync mount --remote {}",
                 repo.display()
             );
             Ok(())
         }
         Command::Mount {
-            repo,
-            drive,
+            remote,
+            into,
+            branch,
+            depth,
             readonly,
-        } => mount(repo, drive, readonly),
+        } => mount(remote, into, branch, depth, readonly),
         Command::Unmount => unmount(),
     }
 }
 
+/// The default drive folder for a remote when `--into` isn't given: `<cwd>/<repo-name>`.
+fn default_drive(remote: &str) -> PathBuf {
+    let name = bosync_core::repo_name(remote);
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(name)
+}
+
+/// How often the background loop runs `git fetch --depth=1` to keep the proxy current.
 #[cfg(windows)]
-fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
+const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Run one background refresh tick: fetch the branch, and for every entry the remote changed,
+/// re-dehydrate it on the drive back to a cloud-only "remote" placeholder.
+#[cfg(windows)]
+fn refresh_tick(
+    proxy: &mut bosync_core::Proxy,
+    drive: &std::path::Path,
+    branch: &str,
+    cloud: &bosync_windows::WindowsCloudSync,
+) {
+    use bosync_core::{CloudSync, ProxyState};
+
+    match proxy.refresh_branch(branch) {
+        Ok(changed) if !changed.is_empty() => {
+            tracing::info!(count = changed.len(), "remote advanced; re-dehydrating changed entries");
+            for rel in changed {
+                let abs = drive.join(rel.replace('/', "\\"));
+                cloud.mark_state(drive, &abs, ProxyState::Remote);
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("background refresh failed: {e:#}"),
+    }
+}
+
+#[cfg(windows)]
+fn mount(
+    remote: String,
+    into: Option<PathBuf>,
+    branch: String,
+    depth: u32,
+    readonly: bool,
+) -> Result<()> {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use notify::{RecursiveMode, Watcher};
 
-    use bosync_core::reconcile_path;
+    use bosync_core::{reconcile_path, CloudSync, Proxy, ProxyState, Reconciled};
     use bosync_windows::{mark_tree_in_sync, BosyncFilter, SyncRoot, WindowsCloudSync};
 
+    // Shallow-clone the remote into the internal per-user proxy (the git backend). This is the
+    // "create a proxy" step — a thin shallow copy, not a full clone.
+    let mut proxy = Proxy::open_or_clone_in(&remote, &Proxy::proxy_dir(&remote), depth)
+        .with_context(|| format!("shallow-cloning {remote}"))?;
+    let git = proxy.git().clone();
+
+    // The drive is the folder the user browses; it starts empty so every entry projects as a
+    // cloud-only "remote" placeholder.
+    let drive = into.unwrap_or_else(|| default_drive(&remote));
     std::fs::create_dir_all(&drive).with_context(|| format!("creating drive folder {drive:?}"))?;
     // Canonicalize so the root matches the long-form paths the OS reports in callbacks, then
     // strip the `\\?\` verbatim prefix which Cloud Filter registration rejects.
@@ -101,8 +166,6 @@ fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
         std::fs::canonicalize(&drive)
             .with_context(|| format!("canonicalizing drive folder {drive:?}"))?,
     );
-
-    let git = GitBackend::open(&repo)?;
 
     let sync_root = SyncRoot::register(PROVIDER, DISPLAY_NAME, VERSION, &drive)?;
     let filter = BosyncFilter::new(git.clone(), drive.clone());
@@ -117,18 +180,23 @@ fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
         .context("setting Ctrl-C handler")?;
 
     let mode = if readonly { " (read-only)" } else { "" };
-    println!("bosync mounted{mode}: {} -> {}", repo.display(), drive.display());
-    println!("Open it in Explorer. Press Ctrl+C to unmount.");
+    println!("bosync mounted{mode}: {remote} -> {}", drive.display());
+    println!("Open it in Explorer. Entries start as cloud-only; Ctrl+C to unmount.");
+
+    // The platform seam: skips dehydrated placeholders and drives the Explorer overlays.
+    let cloud = WindowsCloudSync;
+    let mut last_refresh = Instant::now();
 
     if readonly {
+        // No write-back; just keep the proxy current in the background.
         while running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(300));
+            if last_refresh.elapsed() >= REFRESH_INTERVAL {
+                last_refresh = Instant::now();
+                refresh_tick(&mut proxy, &drive, &branch, &cloud);
+            }
         }
     } else {
-        // The platform seam used during write-back: skips dehydrated placeholders and clears
-        // Explorer overlays after each commit.
-        let cloud = WindowsCloudSync;
-
         let (tx, rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
@@ -151,9 +219,20 @@ fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     for path in pending.drain() {
-                        if let Err(e) = reconcile_path(&git, &cloud, &drive, &path) {
-                            tracing::warn!(?path, "reconcile failed: {e:#}");
+                        match reconcile_path(&git, &cloud, &drive, &path) {
+                            // Committed locally. Pure-Rust push isn't in gix yet, so the change
+                            // stays on this machine — the file is Local (pending), not Synced.
+                            // Once push lands, this is where it would promote to Synced.
+                            Ok(Reconciled::Committed) => {
+                                cloud.mark_state(&drive, &path, ProxyState::Local);
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(?path, "reconcile failed: {e:#}"),
                         }
+                    }
+                    if last_refresh.elapsed() >= REFRESH_INTERVAL {
+                        last_refresh = Instant::now();
+                        refresh_tick(&mut proxy, &drive, &branch, &cloud);
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -168,23 +247,37 @@ fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn mount(repo: PathBuf, drive: PathBuf, readonly: bool) -> Result<()> {
-    // The FUSE projection is read-only today; accept the flag for parity with Windows.
-    let _ = readonly;
-    std::fs::create_dir_all(&drive)
-        .with_context(|| format!("creating mountpoint {drive:?}"))?;
-    let git = GitBackend::open(&repo)?;
-    println!(
-        "bosync mounting (read-only FUSE): {} -> {}",
-        repo.display(),
-        drive.display()
-    );
+fn mount(
+    remote: String,
+    into: Option<PathBuf>,
+    branch: String,
+    depth: u32,
+    readonly: bool,
+) -> Result<()> {
+    use bosync_core::Proxy;
+
+    // The FUSE projection is read-only today; accept the flag for parity with Windows. Background
+    // refresh isn't wired through the blocking FUSE mount yet (Windows is the full path).
+    let _ = (readonly, &branch);
+    let proxy = Proxy::open_or_clone_in(&remote, &Proxy::proxy_dir(&remote), depth)
+        .with_context(|| format!("shallow-cloning {remote}"))?;
+    let git = proxy.git().clone();
+
+    let drive = into.unwrap_or_else(|| default_drive(&remote));
+    std::fs::create_dir_all(&drive).with_context(|| format!("creating mountpoint {drive:?}"))?;
+    println!("bosync mounting (read-only FUSE): {remote} -> {}", drive.display());
     println!("Press Ctrl+C, or run:  fusermount3 -u {}", drive.display());
     bosync_linux::mount(git, &drive) // blocks until unmounted
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn mount(_repo: PathBuf, _drive: PathBuf, _readonly: bool) -> Result<()> {
+fn mount(
+    _remote: String,
+    _into: Option<PathBuf>,
+    _branch: String,
+    _depth: u32,
+    _readonly: bool,
+) -> Result<()> {
     anyhow::bail!("`mount` is not wired up for this OS yet (macOS File Provider is pending)")
 }
 

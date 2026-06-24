@@ -8,6 +8,39 @@
 
 use std::path::Path;
 
+/// The sync state of one proxy entry, as shown by an overlay in the file manager.
+///
+/// This is the cross-platform vocabulary for the "view states when proxy is running" criterion.
+/// The lifecycle, and the transitions between states, are:
+///
+/// ```text
+///                 create / edit            push succeeds
+///   Remote  ───────────────────▶  Local  ───────────────▶  Synced
+///     ▲         (commit)                                       │
+///     └───────────────────────────────────────────────────────┘
+///            fetch --depth=1 brings a remote change
+///                  (re-dehydrate to a shallow copy)
+/// ```
+///
+/// - [`Remote`](ProxyState::Remote): the entry lives only on the remote, projected as a
+///   cloud-only placeholder with no local bytes. Every entry starts here right after the proxy
+///   is shallow-cloned.
+/// - [`Local`](ProxyState::Local): the entry is present on disk with a change that has been
+///   *committed* but not yet confirmed on the remote (push pending or unsupported). This is the
+///   pending state — and the state a [`Synced`](ProxyState::Synced) entry holds while it is
+///   kept on disk, until a fetch brings in a newer remote version.
+/// - [`Synced`](ProxyState::Synced): the local copy has been committed **and** pushed, so it is
+///   confirmed identical to the remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyState {
+    /// Cloud-only placeholder; no local data. The state of every entry just after cloning.
+    Remote,
+    /// Present and committed locally, but not yet confirmed on the remote (push pending).
+    Local,
+    /// Committed and pushed: the local copy is confirmed identical to the remote.
+    Synced,
+}
+
 /// The cloud-sync facility of one platform.
 ///
 /// The methods the core actually needs to drive write-back and the idle engine in a
@@ -33,6 +66,26 @@ pub trait CloudSync {
     /// Called by the idle engine for files untouched for a while. Default no-op.
     fn dehydrate(&self, abs: &Path) {
         let _ = abs;
+    }
+
+    /// Reflect a [`ProxyState`] transition for `abs` in the file manager's overlay.
+    ///
+    /// This is the single seam the engine uses to drive the "view states" behaviour; it is
+    /// expressed in terms of the two primitives above so platforms only need to implement
+    /// those. The mapping:
+    ///
+    /// - [`Synced`](ProxyState::Synced) → [`mark_in_sync`](CloudSync::mark_in_sync) (green check).
+    /// - [`Remote`](ProxyState::Remote) → [`dehydrate`](CloudSync::dehydrate) (cloud-only).
+    /// - [`Local`](ProxyState::Local) → leave the on-disk file as-is: it is present with a
+    ///   pending change, which the file manager already shows as "pending sync".
+    ///
+    /// Platforms with richer per-state overlays can override this to be more precise.
+    fn mark_state(&self, root: &Path, abs: &Path, state: ProxyState) {
+        match state {
+            ProxyState::Synced => self.mark_in_sync(root, abs),
+            ProxyState::Remote => self.dehydrate(abs),
+            ProxyState::Local => {}
+        }
     }
 }
 

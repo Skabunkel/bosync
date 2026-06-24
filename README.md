@@ -78,30 +78,72 @@ writes (which reproduce the git blob exactly) never produce spurious commits.
 
 ## Usage
 
+One command does everything: point `mount` at a remote and you get a live virtual drive.
+bosync shallow-clones the remote into an internal per-user proxy and projects *that* — you
+never run a `clone` or `fetch` yourself.
+
 ```powershell
 # Build
 cargo build --release
 
-# Create a sample backing repo to play with
+# (optional) create a sample repo to use as a fake remote
 cargo run -p bosync-cli -- sample --repo C:\tmp\bosync-repo
 
-# Mount it as a drive (the drive folder is created if missing)
-cargo run -p bosync-cli -- mount --repo C:\tmp\bosync-repo --drive C:\tmp\Mybosync
+# Mount a remote as a live drive (drive folder defaults to <cwd>\<repo-name>)
+cargo run -p bosync-cli -- mount --remote ssh://git@host/owner/repo.git
+cargo run -p bosync-cli -- mount --remote C:\tmp\bosync-repo --into C:\tmp\Mybosync
 
 # Mount read-only: serve reads, never commit local changes back
-cargo run -p bosync-cli -- mount --repo C:\tmp\bosync-repo --drive C:\tmp\Mybosync --readonly
+cargo run -p bosync-cli -- mount --remote C:\tmp\bosync-repo --into C:\tmp\Mybosync --readonly
 ```
 
-Then open `C:\tmp\Mybosync` in Explorer:
+Then open the drive folder in Explorer:
 
-- The files from the repo's `HEAD` appear as placeholders (free up ~0 bytes).
+- The files from the remote's `HEAD` appear as cloud-only placeholders (free up ~0 bytes).
 - Open `hello.txt` → it hydrates from the git blob.
-- Edit and save a file → a commit lands in the backing repo (`git log` to verify) — unless mounted `--readonly`.
+- Edit and save a file → a commit lands in the proxy — unless mounted `--readonly`.
 - Delete a file → a removal commit lands.
+- In the background bosync keeps running `git fetch --depth=1` and re-dehydrates anything the
+  remote changed, so the folder stays a thin, always-current mirror.
 
-An empty (freshly `git init`ed, no commits) repo mounts fine and shows an empty drive.
+An empty (no commits) remote mounts fine and shows an empty drive.
 
 Press **Ctrl+C** in the terminal to unmount and unregister the sync root.
+
+## Proxies & sync states
+
+A **proxy** is the internal **shallow clone** of the remote that the OS projects as the drive.
+It's created automatically by `mount` (depth `1` by default — just the current tree, the
+smallest possible; tune with `--depth`). You don't manage it directly.
+
+While mounted, each entry carries one of three **sync states**, shown as an overlay in the file
+manager:
+
+| State | Meaning | Shown when |
+|---|---|---|
+| **remote** | Cloud-only placeholder, no local bytes | Every entry right after mount |
+| **local** | Present locally, committed but **not yet pushed** | You create/edit a file |
+| **synced** | Committed **and** pushed — confirmed identical to the remote | A push succeeds |
+
+The transitions follow the mount lifecycle:
+
+```
+                 create / edit            push succeeds
+   remote  ───────────────────▶  local  ───────────────▶  synced
+     ▲         (commit)                                       │
+     └───────────────────────────────────────────────────────┘
+       background fetch --depth=1 brings a remote change
+              (re-dehydrate the changed entries)
+```
+
+A file becomes **synced only once it has been committed *and* pushed** — until the push lands
+it stays **local**, so the overlay never claims "in sync" for work that's still only on this
+machine. (Pure-Rust push is still pending in `gix`; until then files honestly remain `local`.)
+
+The state model lives in `bosync-core` (`ProxyState`, `Proxy::on_save`, `Proxy::refresh_branch`)
+and is platform-agnostic; each platform's `CloudSync::mark_state` maps it to the OS overlay. The
+background refresh runs the gitoxide equivalent of `git fetch --depth=1 origin <branch>` in
+place and fast-forwards `HEAD`, so the running mount serves new content without a re-clone.
 
 ## Sync interview (`bosync sync`)  — the primary interface
 

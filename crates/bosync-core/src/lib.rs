@@ -16,9 +16,9 @@ mod mount;
 mod proxy;
 mod reconcile;
 
-pub use mount::{CloudSync, NullCloudSync};
-pub use proxy::{Proxy, DEFAULT_DEPTH};
-pub use reconcile::{reconcile_path, to_git_path};
+pub use mount::{CloudSync, NullCloudSync, ProxyState};
+pub use proxy::{repo_name, Proxy, DEFAULT_DEPTH};
+pub use reconcile::{reconcile_path, to_git_path, Reconciled};
 
 #[cfg(test)]
 mod testutil {
@@ -53,6 +53,34 @@ mod testutil {
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use crate::{CloudSync, ProxyState};
+
+    /// A [`CloudSync`] that records the last [`ProxyState`] requested per path, so tests can
+    /// assert the engine drives the documented transitions without a real OS overlay.
+    #[derive(Default)]
+    pub struct RecordingCloudSync {
+        states: RefCell<HashMap<PathBuf, ProxyState>>,
+    }
+
+    impl RecordingCloudSync {
+        pub fn state_of(&self, abs: &Path) -> Option<ProxyState> {
+            self.states.borrow().get(abs).copied()
+        }
+    }
+
+    impl CloudSync for RecordingCloudSync {
+        fn is_dehydrated(&self, abs: &Path) -> bool {
+            self.state_of(abs) == Some(ProxyState::Remote)
+        }
+
+        fn mark_state(&self, _root: &Path, abs: &Path, state: ProxyState) {
+            self.states.borrow_mut().insert(abs.to_path_buf(), state);
         }
     }
 }
