@@ -326,6 +326,37 @@ fn mount(
                 Tick::Idle(_) => {}
             }
         }
+
+        // Shutdown flush: the batched-push policy means there can be up to ~20s of committed-but-
+        // unpushed work (and maybe a just-written file the debounce hasn't reconciled yet) when
+        // Ctrl+C fires. Drain the last events and force one final push so we never lose data on
+        // exit. (Reached on both Ctrl+C and a watcher disconnect.)
+        tracing::info!("flushing pending changes before unmount…");
+        while let Ok(event) = rx.try_recv() {
+            for path in event.paths {
+                if !in_git_dir(&path) {
+                    pending.insert(path);
+                }
+            }
+        }
+        let pending_paths: Vec<PathBuf> = pending.drain().collect();
+        match bosync_core::flush_to_remote(
+            &git,
+            &cloud,
+            &drive,
+            &remote,
+            &pending_paths,
+            pushed_head.as_deref(),
+        ) {
+            Ok(Some(_head)) => {
+                mark_tree_in_sync(&drive);
+                tracing::info!("final push complete — all changes are on the remote");
+            }
+            Ok(None) => {}
+            // Not data loss: the commits are durable in the local `.git`; they push on next mount.
+            // Only a network remote (no pack send yet) ends up here.
+            Err(e) => tracing::warn!("final push failed (changes kept locally in .git): {e:#}"),
+        }
     }
 
     drop(_connection);

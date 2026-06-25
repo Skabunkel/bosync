@@ -1,17 +1,16 @@
 # bosync
 
-Once upton a time called bofink disk sync, it was part of a git clone thing i was building. 
-I had 12 000 dreams and equally as many projects trying to build parts of it. 
+Bosync is a backup to, right now. It cannot handle merge conflicts right now.
 
-Im still working on it but people might want this stuff for future use. Who knows, people might really use it.
+## What is this
 
-I have had AI rewrite alot of this, and change the structure. This does not look like the original project i once created many months ago.
+Bosync AKA Bofink Sync formaly known as Bofink disk sync. 
+Bofink is a codesharing platform i have been working it, this tool was origianlly built for use with pijul. 
+But pijul repos are bigger than git repos, I want to work on that but i have other stuff to do right now <_< life why you live life.
 
-Ill add alot of this was broken when i let AI take care of it so it will probably still be a bit broken.
+### Why would pijul work better for this?
 
-I tried to not have any local proxies, but that didnt work now im rolling back...
-
-When i started this i used windows, now i have linux <_< So much dead code.
+It handles conflicts better. But as i have said the repos grow bigger.
 
 ## Original text
 
@@ -107,7 +106,9 @@ root so the entries get sync-state overlays. Then open it in Explorer:
   are **paced and jittered**, and yield while you still have unpushed work.
 
 Re-mounting the same folder reuses the existing clone. An empty (no commits) remote mounts fine
-and shows an empty folder. Press **Ctrl+C** to unmount and unregister the sync root.
+and shows an empty folder. Press **Ctrl+C** to unmount and unregister the sync root — on the way
+out bosync **flushes**: it reconciles any last writes and forces one final push, so the batching
+delay can't cost you data on exit.
 
 ## The proxy folder & sync states
 
@@ -162,6 +163,14 @@ The scheduler is pure and deterministic — jitter is a seeded xorshift PRNG —
 is unit-tested against a synthetic clock with no real time, network, or randomness. A
 committed-but-unpushed entry shows the **syncing** overlay until the batched push promotes the
 tree to **synced**.
+
+**Shutdown flush.** Because pushes are deferred, exiting could otherwise strand up to ~20s of
+committed work (or a just-written file the debounce hadn't reached) only in the local `.git`. So
+on unmount (Ctrl+C *or* a watcher disconnect) `bosync_core::flush_to_remote` drains the last
+events, reconciles them into commits, and forces one final push. If that push fails (a network
+remote with no pack send), the commits are still durable locally and go out on the next mount —
+it's "not yet on the remote", never lost. The flush is unit-tested directly: a file written to the
+working copy but never committed is reconciled *and* lands on a real local remote.
 
 ## Sync interview (`bosync sync`)  — the primary interface
 

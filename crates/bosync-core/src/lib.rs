@@ -19,7 +19,7 @@ mod schedule;
 
 pub use mount::{CloudSync, NullCloudSync, ProxyState};
 pub use proxy::{repo_name, Proxy, DEFAULT_DEPTH};
-pub use reconcile::{reconcile_path, to_git_path, Reconciled};
+pub use reconcile::{flush_to_remote, reconcile_path, to_git_path, Reconciled};
 pub use schedule::{SyncPolicy, SyncScheduler, Tick};
 
 #[cfg(test)]

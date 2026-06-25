@@ -5,7 +5,7 @@
 //! Cloud Filter provider (and, later, FUSE / File Provider) drives it through a filesystem
 //! watcher.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use bosync_git::GitBackend;
 
@@ -101,6 +101,41 @@ pub fn reconcile_path<C: CloudSync>(
     }
 }
 
+/// Flush all outstanding local changes to the remote — the shutdown path, so batched-but-unpushed
+/// work is never lost when the mount exits.
+///
+/// First reconciles every still-`pending` path into a commit (a reconcile error for one path is
+/// logged and skipped, never aborting the flush). Then, if the proxy's `HEAD` has moved past
+/// `pushed_head`, pushes once. Returns:
+///
+/// - `Ok(Some(head))` — a push happened; `head` is the newly-published commit (the caller can mark
+///   the tree in-sync and remember it as the new `pushed_head`).
+/// - `Ok(None)` — nothing was outstanding, so no push was needed.
+/// - `Err(_)` — the push itself failed (e.g. a network remote with no pack send). The reconciled
+///   commits are still durable in the local `.git`, so this is "not yet on the remote", not data
+///   loss; the caller should surface it but the bytes are safe.
+pub fn flush_to_remote<C: CloudSync>(
+    git: &GitBackend,
+    cloud: &C,
+    root: &Path,
+    remote: &str,
+    pending: &[PathBuf],
+    pushed_head: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    for path in pending {
+        if let Err(e) = reconcile_path(git, cloud, root, path) {
+            tracing::warn!(?path, "reconcile during flush failed: {e:#}");
+        }
+    }
+    let head = git.rev_id("HEAD");
+    if head.as_deref() != pushed_head {
+        git.push(remote)?;
+        tracing::info!("flush: pushed outstanding changes to remote");
+        return Ok(head);
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +198,58 @@ mod tests {
 
         assert_eq!(outcome, Reconciled::Removed);
         assert!(git.read_blob("hello.txt").is_err(), "blob removed from git");
+    }
+
+    #[test]
+    fn flush_reconciles_uncommitted_work_and_pushes_it() {
+        // A remote (the push target) and a shallow clone of it (the proxy/working copy).
+        let remote_dir = TmpDir::new();
+        GitBackend::init_sample(remote_dir.path()).expect("init remote");
+        let remote_url = remote_dir.path().to_string_lossy().into_owned();
+
+        let proxy_dir = TmpDir::new();
+        let proxy = GitBackend::clone_shallow(&remote_url, proxy_dir.path(), 1).expect("clone");
+        let root = proxy_dir.path();
+
+        // Simulate the shutdown race: a file written to the working copy that the debounce never
+        // got to reconcile (so HEAD still equals what the remote has).
+        let pushed_head = proxy.rev_id("HEAD");
+        let file = root.join("urgent.txt");
+        std::fs::write(&file, b"must not be lost\n").unwrap();
+
+        let result = flush_to_remote(
+            &proxy,
+            &NullCloudSync,
+            root,
+            &remote_url,
+            &[file],
+            pushed_head.as_deref(),
+        )
+        .expect("flush");
+
+        // The flush committed the file and pushed — HEAD advanced and a new head was returned.
+        assert!(result.is_some(), "flush should report a push");
+        assert_ne!(proxy.rev_id("HEAD"), pushed_head, "flush committed the file");
+
+        // And it actually landed on the remote.
+        let remote = GitBackend::open(remote_dir.path()).expect("open remote");
+        assert_eq!(remote.read_blob("urgent.txt").unwrap(), b"must not be lost\n");
+    }
+
+    #[test]
+    fn flush_is_a_noop_when_nothing_is_outstanding() {
+        let remote_dir = TmpDir::new();
+        GitBackend::init_sample(remote_dir.path()).expect("init remote");
+        let remote_url = remote_dir.path().to_string_lossy().into_owned();
+
+        let proxy_dir = TmpDir::new();
+        let proxy = GitBackend::clone_shallow(&remote_url, proxy_dir.path(), 1).expect("clone");
+
+        let pushed_head = proxy.rev_id("HEAD");
+        let result =
+            flush_to_remote(&proxy, &NullCloudSync, proxy_dir.path(), &remote_url, &[], pushed_head.as_deref())
+                .expect("flush");
+
+        assert!(result.is_none(), "nothing outstanding → no push");
     }
 }
